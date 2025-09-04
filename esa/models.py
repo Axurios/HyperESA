@@ -337,7 +337,7 @@ class Estimator(pl.LightningModule):
                 h = h[dense_batch_index]
         
         
-        h = torch.mean(h, dim=1) ## added by AD
+        # h = torch.mean(h, dim=1) ## added by AD
         predictions = torch.flatten(self.output_mlp(torch.flatten(h, start_dim=1)))
         #print(self.output_mlp) # give Linear(in_features=32, out_features=1, bias=True)
         #print(self.output_mlp(h).shape)

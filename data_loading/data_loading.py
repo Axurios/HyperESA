@@ -3,7 +3,7 @@ import pandas as pd
 import os
 import torch
 import torch_geometric
-from torch_geometric.utils import degree
+from torch_geometric.utils import degree, dense_to_sparse
 from torch_geometric.data import Data, InMemoryDataset
 from torch.utils.data import random_split
 from sklearn.preprocessing import StandardScaler
@@ -15,6 +15,8 @@ from data_loading.pyg_molecular_datasets.molecule_net import MoleculeNet as Cust
 from data_loading.lrgb import PeptidesFunctionalDataset, PeptidesStructuralDataset
 from data_loading.graphgps_utils import join_dataset_splits
 from data_loading.transforms import *
+
+from data_loading.hypergraph_construction import get_subgraph_vocabulary, add_hyper_edges_to_dataset
 
 from rdkit import RDLogger
 
@@ -389,7 +391,11 @@ def load_tudataset(dataset_name, download_dir, one_hot=True, **kwargs):
     return train, val, test, num_classes, task_type, None
 
 
-def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
+
+
+
+
+def load_qm9_chemprop(download_dir, one_hot, target_name, add_hyper_edges=False, **kwargs):
     transforms = [
         SelectTarget(QM9_TARGETS.index(target_name)),
         ChempropFeatures(one_hot=one_hot, max_atomic_number=9),
@@ -428,8 +434,22 @@ def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
         dataset, lengths=[train_len, val_len, test_len], generator=torch.Generator().manual_seed(42)
     )
 
-    print("Scaling dataset y values...")
+    # --- New Logic Here ---
+    if add_hyper_edges:
+        # Compute the subgraph vocabulary from the training set.
+        print("Creating the hyperedges vocab from training set...")
+        hyperedge_vocabulary = get_subgraph_vocabulary(train, max_subgraph_size=3)
 
+        print("Adding hyper_edges from vocab to each graph...")
+        train_hyper = add_hyper_edges_to_dataset(train, hyperedge_vocabulary)
+        val_hyper = add_hyper_edges_to_dataset(val, hyperedge_vocabulary)
+        test_hyper = add_hyper_edges_to_dataset(test, hyperedge_vocabulary)
+
+        train = train_hyper ; val = val_hyper ; test = test_hyper
+    # ----------------------
+
+
+    print("Scaling dataset y values...")
     y_scaler = scale_y_for_regression_task(train)
 
     train = subset_to_pyg_dataset(train, scaler=y_scaler)
@@ -1041,6 +1061,16 @@ def load_heterophilic(dataset, dataset_dir, **kwargs):
     print("Finished loading data!")
 
     return train, val, test, num_classes, task_type, None, train_mask, val_mask, test_mask
+
+
+## -------
+
+
+
+## --------
+
+
+
 
 
 def get_dataset_train_val_test(dataset, dataset_dir, **kwargs):

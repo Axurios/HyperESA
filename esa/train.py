@@ -110,6 +110,7 @@ def main():
     parser.add_argument("--out-path", type=str)
     parser.add_argument("--config-json-path", type=str)
     parser.add_argument("--wandb-project-name", type=str)
+    parser.add_argument("--wandb-id", type=str, default=None)
     
 
     args = parser.parse_args()
@@ -213,7 +214,7 @@ def main():
     else:
         # Warning: requires fairseq
         from data_loading.data_loading_OCP import load_ocp
-        from hesa.models_OCP import Estimator as Estimator_OCP
+        from esa.models_OCP import Estimator as Estimator_OCP
         print("Please download the corresponding data files from https://fair-chem.github.io/core/datasets/oc20.html")
         train, scaler = load_ocp("/media/david/Media/ocp_test_nov2024/is2re/10k/train/data.lmdb", is_train=True, scaler=None)
         val, _ = load_ocp("/media/david/Media/ocp_test_nov2024/is2re/all/val_id/data.lmdb", is_train=False, scaler=scaler)
@@ -243,8 +244,32 @@ def main():
 
     config_json_path = save_arguments_to_json(argsdict, output_save_dir)
 
+    resume_id = argsdict.get("wandb_id")
+    checkpoint_path_to_resume = None
+    
+    if resume_id:
+        # Check if a checkpoint path was explicitly provided
+        if argsdict["ckpt_path"]:
+            checkpoint_path_to_resume = argsdict["ckpt_path"]
+        else:
+            # If not, look for the latest checkpoint in the output directory
+            latest_ckpt = max(
+                Path(output_save_dir).rglob("*.ckpt"),
+                key=os.path.getctime,
+                default=None
+            )
+            if latest_ckpt:
+                checkpoint_path_to_resume = str(latest_ckpt)
+                print(f"Found latest checkpoint to resume from: {checkpoint_path_to_resume}")
+            else:
+                warnings.warn("No checkpoint found to resume from, starting a new run.")
+                resume_id = None # Reset resume_id so WandB starts a new run
+
     # Logging
-    logger = WandbLogger(name=run_name, project=wandb_project_name, save_dir=output_save_dir)
+    logger = WandbLogger(name=run_name, project=wandb_project_name, save_dir=output_save_dir, 
+                        id=resume_id, # Use the provided ID
+                        resume="must" if resume_id else None
+    ) # Only resume if an ID is given
 
     # Callbacks
     monitor_mode = "max" if "MCC" in monitor_loss_name else "min"
@@ -299,9 +324,19 @@ def main():
     ############## Learning and model set-up ##############
     trainer = pl.Trainer(**trainer_args)
 
-    trainer.fit(
-        model=model, train_dataloaders=train_loader, val_dataloaders=[val_loader, test_loader], ckpt_path=ckpt_path
-    )
+    try:
+        trainer.fit(
+            model=model, train_dataloaders=train_loader, val_dataloaders=[val_loader, test_loader], ckpt_path=ckpt_path
+        )
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Saving a temporary checkpoint...")
+        trainer.save_checkpoint(f"{output_save_dir}/interrupted_checkpoint.ckpt")
+        print("Temporary checkpoint saved.")
+        raise  # Re-raise the exception to terminate the program
+
+    # trainer.fit(
+    #     model=model, train_dataloaders=train_loader, val_dataloaders=[val_loader, test_loader], ckpt_path=ckpt_path
+    # )
     max_memory_allocated = torch.cuda.max_memory_allocated()
     max_memory_reserved = torch.cuda.max_memory_reserved()
 
