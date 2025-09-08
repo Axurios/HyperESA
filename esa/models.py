@@ -3,12 +3,14 @@ import math
 import numpy as np
 import pytorch_lightning as pl
 import bitsandbytes as bnb
+import itertools
 
 from torch import nn
 from torch.nn import functional as F
 from torch_geometric.utils import to_dense_batch
 from collections import defaultdict
 from typing import Optional, List
+import torch_scatter
 
 from utils.norm_layers import BN, LN
 from esa.masked_layers import ESA
@@ -33,6 +35,74 @@ pept_struct_target_names = ["Inertia_mass_a", "Inertia_mass_b", "Inertia_mass_c"
 
 def nearest_multiple_of_8(n):
     return math.ceil(n / 8) * 8
+
+
+def find_max_robust(nested_list):
+    """
+    Finds the maximum integer in a nested list of any shape.
+    This is a more robust solution than using fixed nested loops.
+
+    Args:
+        nested_list (list): The list containing integers and/or other lists.
+
+    Returns:
+        int or None: The maximum integer found, or None if the list is empty.
+    """
+    # Use a list as a stack for an iterative, non-recursive approach
+    stack = [nested_list]
+    max_value = float('-inf')
+    found_number = False
+
+    while stack:
+        current_item = stack.pop()
+
+        if isinstance(current_item, list):
+            # If the item is a list, extend the stack with its contents
+            stack.extend(current_item)
+        elif isinstance(current_item, (int, float)):
+            # If the item is a number, compare and update the maximum
+            if current_item > max_value:
+                max_value = current_item
+            found_number = True
+        # Ignore other data types for this specific task
+
+    if not found_number:
+        return None
+        
+    return max_value
+
+
+def count_unique_integers(nested_list):
+    """
+    Counts the number of unique integers in a nested list of any shape.
+
+    Args:
+        nested_list (list): The list containing integers and/or other lists.
+
+    Returns:
+        int: The number of different integers found.
+    """
+    # Use a set to store unique integers.
+    unique_integers = set()
+
+    # Use a list as a stack for an iterative, non-recursive approach
+    stack = [nested_list]
+
+    while stack:
+        current_item = stack.pop()
+
+        if isinstance(current_item, list):
+            # If the item is a list, extend the stack with its contents
+            stack.extend(current_item)
+        elif isinstance(current_item, int):
+            # If the item is an integer, add it to the set.
+            # The set automatically handles uniqueness.
+            unique_integers.add(current_item)
+        # Note: We are specifically looking for integers, so we will not add floats.
+        # This can be easily changed by adding `float` to the `isinstance` check.
+
+    print(f"The unique integers found are: {sorted(list(unique_integers))}")
+    return len(unique_integers)
 
 
 class Estimator(pl.LightningModule):
@@ -152,6 +222,7 @@ class Estimator(pl.LightningModule):
         self.apply_attention_on = apply_attention_on
         self.posenc = posenc
         self.num_mlp_layers = num_mlp_layers
+        self.use_hyperedges = kwargs.get('use_hyperedges', False)
 
         self.rwse_encoder = None
         self.lap_encoder = None
@@ -310,21 +381,73 @@ class Estimator(pl.LightningModule):
 
         # ESA
         if self.apply_attention_on == "edge":
-            # print("there !!!!")
-            source = x[edge_index[0, :], :]
-            target = x[edge_index[1, :], :]
+            source = x[edge_index[0, :], :] ; target = x[edge_index[1, :], :]
             h = torch.cat((source, target), dim=1)
 
             if self.edge_dim is not None and edge_attr is not None:
                 h = torch.cat((h, edge_attr.float()), dim=1)
+            edge_batch_index = batch_mapping.index_select(0, edge_index[0, :])
+
+            # ----------------- HYPEREDGES -----------------
+            h_hyperedge_output = None
+            if self.use_hyperedges and hasattr(batch, 'hyperedges') and batch.hyperedges:
+                total_hyperedges = sum(len(graph_hyperedges) for graph_hyperedges in batch.hyperedges)
+                hyperedge_nodes_shifted = [] ; hyperedge_index_map = []
+                hyperedge_nodes_shifted_list = [] ; hyperedge_index_map_list = []
+            
+                num_hyperedges_per_graph = torch.tensor([len(g_h) for g_h in batch.hyperedges], device=x.device, dtype=torch.long)
+                hyperedge_id_shifts = torch.cumsum(num_hyperedges_per_graph, dim=0)
+                hyperedge_id_shifts = torch.cat([torch.tensor([0], device=x.device), hyperedge_id_shifts[:-1]])
+                for i in range(len(batch.hyperedges)):
+                    graph_hyperedges = batch.hyperedges[i] ; node_shift = batch.ptr[i]
+                    if not graph_hyperedges:
+                        continue
+                    flat_nodes = torch.tensor([node for h_nodes in graph_hyperedges for node in h_nodes], device=x.device, dtype=torch.long)
+                    shifted_nodes = flat_nodes + node_shift
+                    hyperedge_nodes_shifted_list.append(shifted_nodes)
+                    
+                    hyperedge_lengths = torch.tensor([len(h_nodes) for h_nodes in graph_hyperedges], device=x.device, dtype=torch.long)
+                    hyperedge_ids = torch.arange(len(graph_hyperedges), device=x.device, dtype=torch.long) + hyperedge_id_shifts[i]
+                    hyperedge_index_map_list.append(torch.repeat_interleave(hyperedge_ids, hyperedge_lengths))
+                    
+                hyperedge_nodes_shifted = torch.cat(hyperedge_nodes_shifted_list, dim=0)
+                hyperedge_index_map = torch.cat(hyperedge_index_map_list, dim=0)
+
+                #hyperedge_nodes_shifted = torch.tensor(hyperedge_nodes_shifted, device=x.device, dtype=torch.long)
+                #hyperedge_index_map = torch.tensor(hyperedge_index_map, device=x.device, dtype=torch.long)
+                h_x_mean = torch_scatter.scatter_mean(x[hyperedge_nodes_shifted], hyperedge_index_map, dim=0)  # Now perform the scatter operation with the correctly shifted indices
+
+                h_hyperedge_base = torch.cat((h_x_mean, h_x_mean), dim=1) # print(h_hyperedge_base.shape)
+                num_hyperedges = h_x_mean.shape[0]
+                feature_dim = h_x_mean.shape[1]
+
+                # Create a new tensor of zeros with the desired shape
+                h_hyperedge_base = torch.zeros(num_hyperedges, 2 * feature_dim, dtype=h_x_mean.dtype, device=h_x_mean.device)
+                h_hyperedge_output = h_hyperedge_base
+                
+                # The final shape is [num_hyperedges, 2*n + e]
+                if self.edge_dim is not None and edge_attr is not None:     
+                    hyperedge_attr_zeros = torch.zeros((total_hyperedges, self.edge_dim), device=x.device, dtype=x.dtype)
+                    h_hyperedge_output = torch.cat((h_hyperedge_base, hyperedge_attr_zeros), dim=1)
+            
+                if h_hyperedge_output is not None:
+                    h_combined = torch.cat((h, h_hyperedge_output), dim=0)
+
+                    edge_batch_index = batch_mapping.index_select(0, edge_index[0, :])
+                    hyperedge_batch_index = torch.cat([
+                        torch.full((len(h),), i, device=x.device, dtype=torch.long)
+                        for i, h in enumerate(batch.hyperedges)
+                    ])
+                    # print(edge_batch_index)
+                    # print(hyperedge_batch_index)
+                    combined_batch_index = torch.cat((edge_batch_index, hyperedge_batch_index), dim=0)
+                    h = h_combined ; edge_batch_index = combined_batch_index
+                # ----------------------------------
 
             h = self.node_edge_mlp(h)
-
-            edge_batch_index = batch_mapping.index_select(0, edge_index[0, :])
-            # print(f"num max {num_max_items}")
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
             h = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items)
-            #print(h.shape)
+
 
         # NSA
         else:
@@ -335,14 +458,8 @@ class Estimator(pl.LightningModule):
 
             if self.is_node_task:
                 h = h[dense_batch_index]
-        
-        
-        # h = torch.mean(h, dim=1) ## added by AD
-        predictions = torch.flatten(self.output_mlp(torch.flatten(h, start_dim=1)))
-        #print(self.output_mlp) # give Linear(in_features=32, out_features=1, bias=True)
-        #print(self.output_mlp(h).shape)
-        ## predictions = self.output_mlp(h).squeeze()
 
+        predictions = torch.flatten(self.output_mlp(torch.flatten(h, start_dim=1)))
         return predictions
     
 
@@ -378,17 +495,6 @@ class Estimator(pl.LightningModule):
         batch = None,
     ):
         predictions = self.forward(x, edge_index, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, batch=batch)
-        
-        # # --- Add this section to print the tensor overview ---
-        # print("\n--- Predictions Tensor Overview ---")
-        # print(f"Shape: {predictions.shape}")
-        # print(f"Data type: {predictions.dtype}")
-        # print(f"Device: {predictions.device}")
-        # print(f"Number of elements: {predictions.numel()}")
-        # print("-----------------------------------")
-        # # ----------------------------------------------------
-
-
 
 
         if self.task_type == "multi_classification":
@@ -637,3 +743,63 @@ class Estimator(pl.LightningModule):
         self.test_true[self.num_called_test] = y_true
 
         self.num_called_test += 1
+
+
+
+
+
+                # hyperedge_nodes_flat = torch.tensor(list(itertools.chain.from_iterable(batch.hyperedges)), 
+                #                     device=x.device, 
+                #                     dtype=torch.long)
+
+                # # hyperedge_nodes_flat = torch.tensor(
+                # #     list(itertools.chain.from_iterable(itertools.chain.from_iterable(batch.hyperedges))), 
+                # #     device=x.device, 
+                # #     dtype=torch.long
+                # # )
+
+                # # 2. Create an index map to group the nodes by hyperedge
+                # #    This tensor is the same size as `hyperedge_nodes_flat` and tells the scatter
+                # #    operation which hyperedge each node belongs to.
+                # hyperedge_index_map = torch.cat([
+                #     torch.full((len(h),), i, device=x.device, dtype=torch.long)
+                #     for i, h in enumerate(batch.hyperedges)
+                # ])
+                # # hyperedge_nodes_flat = torch.cat([torch.tensor(he, device=x.device, dtype=torch.long) for he in batch.hyperedges])
+                # # hyperedge_index_map = torch.cat([
+                # #     torch.full((len(h),), i, device=x.device, dtype=torch.long)
+                # #     for i, h in enumerate(batch.hyperedges)
+                # # ])
+
+                # # b) Compute the mean of node features for each hyperedge
+                # h_x_mean = torch_scatter.scatter_mean(x[hyperedge_nodes_flat], hyperedge_index_map, dim=0)
+                # c) Replicate the features to simulate a 'source' and 'target' # This creates a tensor of shape [num_hyperedges, 2*n]
+
+
+
+                                # first_node_idx = batch.hyperedges[0][0]
+                # print(first_node_idx, "first node idx")
+                # # Get the feature from the main node feature tensor `x`
+                # feature_from_x = x[first_node_idx, :]
+                # print(f"Feature from x at index {first_node_idx} (main tensor) is: {feature_from_x[:5]}")
+                # print(f"Batch has {len(batch.hyperedges)} hyperedges in total.")
+                # num_graphs = len(batch.hyperedges)
+                # print("there") # 5 graphs, diiff numbers of hyperedges, with diff number of nodes inside.
+                # print(batch.hyperedges[:5])  # Print first 5 hyperedges to check structure
+                # print("max in batch hyperedges index", find_max_robust(batch.hyperedges))
+                # print("number in batch hyperedges index", count_unique_integers(batch.hyperedges))
+
+
+
+                                # # We iterate through the graphs in the batch
+                # for i in range(len(batch.hyperedges)):
+                #     graph_hyperedges = batch.hyperedges[i]
+                #     node_shift = batch.ptr[i]
+                #     for hyperedge_nodes in graph_hyperedges:
+                #         # Shift the node indices for the current hyperedge
+                #         shifted_nodes = [node + node_shift for node in hyperedge_nodes]
+                #         hyperedge_nodes_shifted.extend(shifted_nodes)
+                #         # Map these nodes to the current hyperedge ID
+                #         hyperedge_index_map.extend([current_hyperedge_id] * len(hyperedge_nodes))
+                #         current_hyperedge_id += 1
+                # Get the number of hyperedges per graph

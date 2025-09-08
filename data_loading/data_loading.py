@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import torch
 import torch_geometric
+import random as rd
 from torch_geometric.utils import degree, dense_to_sparse
 from torch_geometric.data import Data, InMemoryDataset
 from torch.utils.data import random_split
@@ -16,7 +17,7 @@ from data_loading.lrgb import PeptidesFunctionalDataset, PeptidesStructuralDatas
 from data_loading.graphgps_utils import join_dataset_splits
 from data_loading.transforms import *
 
-from data_loading.hypergraph_construction import get_subgraph_vocabulary, add_hyper_edges_to_dataset
+from data_loading.hypergraph_construction import draw_pyg_as_xgi, add_hyper_edges_to_dataset_no_vocab, add_one_random_subgroup_hyperedge
 
 from rdkit import RDLogger
 
@@ -395,7 +396,9 @@ def load_tudataset(dataset_name, download_dir, one_hot=True, **kwargs):
 
 
 
-def load_qm9_chemprop(download_dir, one_hot, target_name, add_hyper_edges=False, **kwargs):
+def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
+    print("Loading QM9 dataset...")
+    add_hyper_edges = kwargs.get("add_hyper_edges", False)
     transforms = [
         SelectTarget(QM9_TARGETS.index(target_name)),
         ChempropFeatures(one_hot=one_hot, max_atomic_number=9),
@@ -436,18 +439,48 @@ def load_qm9_chemprop(download_dir, one_hot, target_name, add_hyper_edges=False,
 
     # --- New Logic Here ---
     if add_hyper_edges:
-        # Compute the subgraph vocabulary from the training set.
-        print("Creating the hyperedges vocab from training set...")
-        hyperedge_vocabulary = get_subgraph_vocabulary(train, max_subgraph_size=3)
+        print("HYPEREDGES TRUE")
+        first_train_idx = train.indices[5] ; first_train_data = dataset[first_train_idx] 
+        # random_train_idx = rd.choice(train.indices) ; random_train_data = dataset[random_train_idx]
+        #draw_pyg_as_xgi(first_train_data)
 
-        print("Adding hyper_edges from vocab to each graph...")
-        train_hyper = add_hyper_edges_to_dataset(train, hyperedge_vocabulary)
-        val_hyper = add_hyper_edges_to_dataset(val, hyperedge_vocabulary)
-        test_hyper = add_hyper_edges_to_dataset(test, hyperedge_vocabulary)
+        # add rd hyperedge to a new object copying the first graph, and draw the new objet
+        # data_with_hyperedge = first_train_data.clone() ; add_random_hyperedge(data_with_hyperedge, num_nodes_in_hyperedge=3)
+        #draw_pyg_as_xgi(data_with_hyperedge)
+
+        # Compute the subgraph vocabulary from the training set.
+        #print("Creating the hyperedges vocab from training set...")
+        #hyperedge_vocabulary = get_subgraph_vocabulary(train, num_hops=3)
+        draw_pyg_as_xgi(first_train_data)
+        single_graph_dataset = [first_train_data]
+        single_graph_hyper_dataset = add_hyper_edges_to_dataset_no_vocab(single_graph_dataset)
+
+        hyper_data_point = single_graph_hyper_dataset[0]
+        draw_pyg_as_xgi(hyper_data_point)
+        
+        # print("vocab hypergraph")
+        # single_graph_hyper_dataset = add_hyper_edges_to_dataset(single_graph_dataset, hyperedge_vocabulary, num_hops=3)
+        # hyper_data_point = single_graph_hyper_dataset[0]
+        
+        #; draw_pyg_as_xgi(hyper_data_point)
+        # if hasattr(hyper_data_point, 'hyperedges') and hyper_data_point.hyperedges:
+        #     print(f"Nombre d'hyperarêtes trouvées : {len(hyper_data_point.hyperedges)}")
+        #     for i, hyperedge in enumerate(hyper_data_point.hyperedges):
+        #         print(f"  Hyperarête {i+1} : {hyperedge}")
+        # else:
+        #     print("Aucune hyperarête n'a été ajoutée à ce graphe.")
+
+
+        #print("Adding hyper_edges from vocab to each graph...")
+        # train_hyper = add_one_random_subgroup_hyperedge(train)
+        # val_hyper = add_one_random_subgroup_hyperedge(val)
+        # test_hyper = add_one_random_subgroup_hyperedge(test)
+        train_hyper = add_hyper_edges_to_dataset_no_vocab(train)
+        val_hyper = add_hyper_edges_to_dataset_no_vocab(val)
+        test_hyper = add_hyper_edges_to_dataset_no_vocab(test)
 
         train = train_hyper ; val = val_hyper ; test = test_hyper
     # ----------------------
-
 
     print("Scaling dataset y values...")
     y_scaler = scale_y_for_regression_task(train)

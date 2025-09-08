@@ -1,7 +1,7 @@
 from torch import nn
 from torch.nn import functional as F
 
-print("should have used flash attn")
+# print("should have used flash attn")
 #from flash_attn.ops.activations import swiglu
 
 

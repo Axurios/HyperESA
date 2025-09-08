@@ -111,6 +111,8 @@ def main():
     parser.add_argument("--config-json-path", type=str)
     parser.add_argument("--wandb-project-name", type=str)
     parser.add_argument("--wandb-id", type=str, default=None)
+    parser.add_argument("--add-hyper-edges", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--use-hyperedges", default=False, action=argparse.BooleanOptionalAction)
     
 
     args = parser.parse_args()
@@ -190,6 +192,7 @@ def main():
             train, val, test, num_classes, task_type, scaler, train_mask, val_mask, test_mask = get_dataset_train_val_test(
                 dataset=dataset,
                 dataset_dir=dataset_download_dir,
+                add_hyper_edges=argsdict.get("add_hyper_edges", False),
             )
         # Graph-level branch
         else:
@@ -199,6 +202,7 @@ def main():
                 one_hot=dataset_one_hot,
                 target_name=target_name,
                 pe_types=posenc,
+                add_hyper_edges=argsdict.get("add_hyper_edges", False),
             )
 
         num_features = train[0].x.shape[-1]
@@ -332,7 +336,7 @@ def main():
         print("\nTraining interrupted by user. Saving a temporary checkpoint...")
         trainer.save_checkpoint(f"{output_save_dir}/interrupted_checkpoint.ckpt")
         print("Temporary checkpoint saved.")
-        raise  # Re-raise the exception to terminate the program
+        return  # Re-raise the exception to terminate the program
 
     # trainer.fit(
     #     model=model, train_dataloaders=train_loader, val_dataloaders=[val_loader, test_loader], ckpt_path=ckpt_path
