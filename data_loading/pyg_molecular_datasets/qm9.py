@@ -144,6 +144,7 @@ class QM9(InMemoryDataset):
                  pre_filter: Optional[Callable] = None):
         super().__init__(root, transform, pre_transform, pre_filter)
         self.data, self.slices = torch.load(self.processed_paths[0])
+        print(self.data.y.shape, "DATA Y SHAPE")
 
     def mean(self, target: int) -> float:
         y = torch.cat([self.get(i).y for i in range(len(self))], dim=0)
@@ -301,7 +302,8 @@ class QM9(InMemoryDataset):
                 name=name,
                 idx=i,
             )
-
+            
+            # print(data.y.shape, "HERE !!!!")
             # We want the pre-transform to happen before filtering, as it might introduce None
             if self.pre_transform is not None:
                 data = self.pre_transform(data)
@@ -310,5 +312,5 @@ class QM9(InMemoryDataset):
                 continue
 
             data_list.append(data)
-
+        # data.y
         torch.save(self.collate(data_list), self.processed_paths[0])

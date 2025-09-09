@@ -15,148 +15,112 @@ from tqdm.auto import tqdm
 import networkx as nx
 # from gspan_mining.gspan import gSpan
 import xgi
-from torch_geometric.data import InMemoryDataset
+# from torch_geometric.data import InMemoryDataset
 #import torch.utils.data as data_utils
 import random
 
 
+from rdkit import Chem
+from rdkit.Chem.rdchem import BondType as BT
+import torch_geometric.transforms as T
+from tqdm import tqdm
 
-# def add_hyper_edges_to_dataset_no_vocab(dataset, min_cycle_len=3, max_cycle_len=9):
-#     """
-#     Adds hyperedges to graphs by directly detecting simple cycles.
 
-#     Args:
-#         dataset (list): The list of PyG Data objects.
-#         min_cycle_len (int): The minimum number of nodes in a cycle (e.g., 3 for a triangle).
-#         max_cycle_len (int): The maximum number of nodes in a cycle.
 
-#     Returns:
-#         list: A new dataset with added hyperedges.
-#     """
-#     new_dataset = dataset.clone()
-    
-#     for new_data in tqdm(new_dataset, desc="Adding hyper-edges from cycles"):
+
+
+
+
+
+
+def add_chem_hyper_edges_func(data):
+    """
+    Core logic to add hyperedges from chemical rings and functional groups.
+    This function expects a PyG Data object with a 'smiles' attribute.
+    """
+    # A dictionary of common functional groups as SMARTS patterns
+    functional_groups = {
+        "AromaticRing": "a",
+        "AliphaticRing": "R",
+        "Hydroxyl": "[OX2H]", 
+        "Carboxyl": "[CX3](=O)[OX2H1]",
+        "Amine": "[NX3;H2,H1;!$(NC=O)]", 
+        "Carbonyl": "[CX3]=O",
+        "Ketone": "[#6][CX3](=O)[#6]", 
+        "Aldehyde": "[#6][CX3H1](=O)", 
+        "Nitro": "[NX3](=[OX1])[OX1]",
+        "Nitrile": "[NX1]#[CX2]",
+    }
+    functional_group_mols = {
+        name: Chem.MolFromSmarts(smarts)
+        for name, smarts in functional_groups.items()
+    }
+
+    # Check if the Data object has a smiles string
+    if not hasattr(data, 'smiles') or data.smiles is None:
+        print("Warning: Data object has no 'smiles' attribute. Skipping hyperedge creation.")
+        data.hyperedges = []
+        return data
+
+    mol = Chem.MolFromSmiles(data.smiles)
+    if mol is None:
+        print(f"Warning: Could not convert SMILES {data.smiles} to RDKit molecule. Skipping hyperedge creation.")
+        data.hyperedges = []
+        return data
         
-#         # Convert the PyG graph to an undirected NetworkX graph
-#         nx_graph = to_networkx(new_data, to_undirected=True)
-        
-#         found_hyperedges_set = set()
+    found_hyperedges = set()
+    hyperedges_list = []
 
-#         # Find all simple cycles in the graph
-#         # This is more direct than the k-hop subgraph approach
-#         for cycle in nx.simple_cycles(nx_graph):
-#             # Check if the cycle length is within the desired range
-#             cycle_len = len(cycle)
-#             if min_cycle_len <= cycle_len <= max_cycle_len:
-#                 # Normalise the hyperedge by sorting the nodes
-#                 new_hyperedge = sorted(cycle)
-#                 found_hyperedges_set.add(frozenset(new_hyperedge))
-        
-#         # Assign the unique hyperedges to the new graph
-#         new_data.hyperedges = [list(h) for h in found_hyperedges_set]
-        
-#     return new_dataset
+    # 1. Identify Ring Systems
+    sssr = Chem.GetSSSR(mol)
+    for ring_nodes in sssr:
+        ring_nodes_set = frozenset(sorted(ring_nodes))
+        if len(ring_nodes_set) < 3:
+            continue
+        if ring_nodes_set not in found_hyperedges:
+            found_hyperedges.add(ring_nodes_set)
+            hyperedges_list.append(sorted(list(ring_nodes_set)))
 
-
-
-# def add_hyper_edges_to_dataset_no_vocab(dataset, min_cycle_len=3, max_cycle_len=9):
-#     """
-#     Adds hyperedges to graphs by directly detecting simple cycles.
-
-#     Args:
-#         dataset (torch_geometric.data.Dataset): The PyG Dataset object.
-#         min_cycle_len (int): The minimum number of nodes in a cycle (e.g., 3 for a triangle).
-#         max_cycle_len (int): The maximum number of nodes in a cycle.
-
-#     Returns:
-#         torch_geometric.data.Dataset: A new Dataset object with added hyperedges.
-#     """
-#     # Loop over the individual Data objects in the dataset
-#     total_hyperedges = 0
-#     for data in tqdm(dataset, desc="Adding hyper-edges from cycles"):
-        
-#         # CORRECT: Clone each individual Data object
-#         #new_data = data.clone()
-        
-#         # Convert the PyG graph to an undirected NetworkX graph
-#         nx_graph = to_networkx(data, to_undirected=True)
-        
-#         found_hyperedges_set = set()
-
-#         for cycle in nx.simple_cycles(nx_graph):
-#             cycle_len = len(cycle)
-#             if min_cycle_len <= cycle_len <= max_cycle_len:
-#                 new_hyperedge = sorted(cycle)
-#                 found_hyperedges_set.add(frozenset(new_hyperedge))
-#         hyperedges_list = [list(h) for h in found_hyperedges_set]
-#         data.hyperedges = hyperedges_list
-#         total_hyperedges += len(hyperedges_list)
-
-#     num_graphs = len(dataset)
-#     if num_graphs > 0:
-#         avg_hyperedges = total_hyperedges / num_graphs
-#         print(f"\nAverage number of hyperedges per graph: {avg_hyperedges:.2f}")
-#     else:
-#         print("\nNo graphs found in the dataset.")
-    
-#     return dataset
-
-# def add_hyper_edges_to_dataset_no_vocab(dataset, min_cycle_len=3, max_cycle_len=9):
-#     """
-#     Adds hyperedges to graphs by directly detecting simple cycles.
-#     The hyperedges are represented by the node features (x) of the nodes
-#     in the cycle, rather than their local indices.
-
-#     Args:
-#         dataset (torch_geometric.data.Dataset): The PyG Dataset object.
-#         min_cycle_len (int): The minimum number of nodes in a cycle (e.g., 3 for a triangle).
-#         max_cycle_len (int): The maximum number of nodes in a cycle.
-
-#     Returns:
-#         torch_geometric.data.Dataset: A new Dataset object with added hyperedges,
-#                                       where hyperedges are lists of node feature tensors.
-#     """
-#     total_hyperedges = 0
-#     for data in tqdm(dataset, desc="Adding hyper-edges from cycles"):
-        
-#         # Convert the PyG graph to an undirected NetworkX graph
-#         nx_graph = to_networkx(data, to_undirected=True)
-        
-#         found_hyperedges_set = set()
-
-#         for cycle in nx.simple_cycles(nx_graph):
-#             cycle_len = len(cycle)
-#             if min_cycle_len <= cycle_len <= max_cycle_len:
-#                 # Get the features (x) for each node in the cycle
-#                 hyperedge_features = [data.x[node_idx] for node_idx in cycle]
+    # 2. Identify Functional Groups
+    for name, fg_mol in functional_group_mols.items():
+        if fg_mol is None: # handle invalid SMARTS patterns
+            continue
+        matches = mol.GetSubstructMatches(fg_mol)
+        for match in matches:
+            # print("found matching func groups")
+            fg_nodes_set = frozenset(sorted(match))
+            if len(fg_nodes_set) < 3:
+                continue
+            if fg_nodes_set not in found_hyperedges:
+                found_hyperedges.add(fg_nodes_set)
+                hyperedges_list.append(sorted(list(fg_nodes_set)))
                 
-#                 # To handle duplicate hyperedges, we need a hashable representation.
-#                 # We can convert the list of tensors to a tuple of tuples.
-#                 # Sorting by some criteria (e.g., the first element of the tensor)
-#                 # ensures that the hyperedge is unique regardless of the cycle's starting node.
-#                 sorted_hyperedge_features = tuple(
-#                     tuple(t.tolist()) for t in sorted(hyperedge_features, key=lambda t: t.tolist())
-#                 )
-                
-#                 found_hyperedges_set.add(sorted_hyperedge_features)
+    # Add the list of hyperedges to the PyG Data object
+    data.hyperedges = hyperedges_list
+    return data
 
-#         # Convert the frozenset of tuples back to a list of lists of tensors
-#         hyperedges_list = [
-#             [torch.tensor(item) for item in hyperedge_tuple]
-#             for hyperedge_tuple in found_hyperedges_set
-#         ]
-        
-#         data.hyperedges = hyperedges_list
-#         total_hyperedges += len(hyperedges_list)
 
-#     num_graphs = len(dataset)
-#     if num_graphs > 0:
-#         avg_hyperedges = total_hyperedges / num_graphs
-#         print(f"\nAverage number of hyperedges per graph: {avg_hyperedges:.2f}")
-#     else:
-#         print("\nNo graphs found in the dataset.")
-    
-#     return dataset
+class AddChemHyperEdges(T.BaseTransform):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, data):
+        data = add_chem_hyper_edges_func(data)
+        return data
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def add_hyper_edges_to_dataset_no_vocab(dataset, min_cycle_len=3, max_cycle_len=9):

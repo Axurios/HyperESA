@@ -6,7 +6,6 @@ import copy
 import torch
 import wandb
 import numpy as np
-# print("ok")
 import pytorch_lightning as pl
 from pathlib import Path
 
@@ -21,7 +20,6 @@ from pytorch_lightning.loggers import WandbLogger
 sys.path.append(os.path.realpath("."))  
 
 from esa.models import Estimator
-# print("okokok")
 from data_loading.data_loading import get_dataset_train_val_test
 from esa.config import (
     save_arguments_to_json,
@@ -29,7 +27,6 @@ from esa.config import (
     validate_argparse_arguments,
     get_wandb_name,
 )
-# print("ok4")
 warnings.filterwarnings("ignore")
 
 os.environ["WANDB__SERVICE_WAIT"] = "500"
@@ -49,7 +46,6 @@ def check_is_node_level_dataset(dataset_name):
     return False
 
 def main():
-    # print("running main")
     torch.set_num_threads(1)
 
     parser = argparse.ArgumentParser()
@@ -61,8 +57,8 @@ def main():
     parser.add_argument("--dataset", type=str)
     parser.add_argument("--dataset-download-dir", type=str)
     parser.add_argument("--dataset-one-hot", default=True, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--dataset-target-name", type=str)
-
+    ## parser.add_argument("--dataset-target-name", type=str)
+    parser.add_argument("--dataset-target-name", type=str, nargs='+')
     # Learning hyperparameters
     parser.add_argument("--lr", type=float)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -185,6 +181,7 @@ def main():
 
     ############## Data loading ##############
     train_mask, val_mask, test_mask = None, None, None
+    
 
     if dataset != "ocp":
         if check_is_node_level_dataset(dataset):

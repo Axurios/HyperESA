@@ -37,73 +37,6 @@ def nearest_multiple_of_8(n):
     return math.ceil(n / 8) * 8
 
 
-def find_max_robust(nested_list):
-    """
-    Finds the maximum integer in a nested list of any shape.
-    This is a more robust solution than using fixed nested loops.
-
-    Args:
-        nested_list (list): The list containing integers and/or other lists.
-
-    Returns:
-        int or None: The maximum integer found, or None if the list is empty.
-    """
-    # Use a list as a stack for an iterative, non-recursive approach
-    stack = [nested_list]
-    max_value = float('-inf')
-    found_number = False
-
-    while stack:
-        current_item = stack.pop()
-
-        if isinstance(current_item, list):
-            # If the item is a list, extend the stack with its contents
-            stack.extend(current_item)
-        elif isinstance(current_item, (int, float)):
-            # If the item is a number, compare and update the maximum
-            if current_item > max_value:
-                max_value = current_item
-            found_number = True
-        # Ignore other data types for this specific task
-
-    if not found_number:
-        return None
-        
-    return max_value
-
-
-def count_unique_integers(nested_list):
-    """
-    Counts the number of unique integers in a nested list of any shape.
-
-    Args:
-        nested_list (list): The list containing integers and/or other lists.
-
-    Returns:
-        int: The number of different integers found.
-    """
-    # Use a set to store unique integers.
-    unique_integers = set()
-
-    # Use a list as a stack for an iterative, non-recursive approach
-    stack = [nested_list]
-
-    while stack:
-        current_item = stack.pop()
-
-        if isinstance(current_item, list):
-            # If the item is a list, extend the stack with its contents
-            stack.extend(current_item)
-        elif isinstance(current_item, int):
-            # If the item is an integer, add it to the set.
-            # The set automatically handles uniqueness.
-            unique_integers.add(current_item)
-        # Note: We are specifically looking for integers, so we will not add floats.
-        # This can be easily changed by adding `float` to the `isinstance` check.
-
-    print(f"The unique integers found are: {sorted(list(unique_integers))}")
-    return len(unique_integers)
-
 
 class Estimator(pl.LightningModule):
     def __init__(
@@ -155,13 +88,28 @@ class Estimator(pl.LightningModule):
 
         self.graph_dim = graph_dim
         self.task_type = task_type
+
+        # print(task_type) # prints regression ok
+
         self.edge_dim = edge_dim
 
         self.num_features = num_features
         self.lr = lr
         self.batch_size = batch_size
         self.scaler = scaler
+
+
+        self.target_names = kwargs.get("dataset_target_name", None)
+        if not isinstance(self.target_names, list):
+            self.target_names = [self.target_names]
+        # print("target names in estimator: ", self.target_names)
+
+        linear_output_size = len(self.target_names) if self.target_names else 1
         self.linear_output_size = linear_output_size
+        #print("linear output size: ", self.linear_output_size)
+        #print("target names: ", self.target_names)
+
+
         self.monitor_loss_name = monitor_loss_name
         self.mlp_hidden_size = mlp_hidden_size
         self.norm_type = norm_type
@@ -388,6 +336,11 @@ class Estimator(pl.LightningModule):
                 h = torch.cat((h, edge_attr.float()), dim=1)
             edge_batch_index = batch_mapping.index_select(0, edge_index[0, :])
 
+
+
+
+
+
             # ----------------- HYPEREDGES -----------------
             h_hyperedge_output = None
             if self.use_hyperedges and hasattr(batch, 'hyperedges') and batch.hyperedges:
@@ -418,11 +371,11 @@ class Estimator(pl.LightningModule):
                 h_x_mean = torch_scatter.scatter_mean(x[hyperedge_nodes_shifted], hyperedge_index_map, dim=0)  # Now perform the scatter operation with the correctly shifted indices
 
                 h_hyperedge_base = torch.cat((h_x_mean, h_x_mean), dim=1) # print(h_hyperedge_base.shape)
-                num_hyperedges = h_x_mean.shape[0]
-                feature_dim = h_x_mean.shape[1]
+                # num_hyperedges = h_x_mean.shape[0]
+                # feature_dim = h_x_mean.shape[1]
 
                 # Create a new tensor of zeros with the desired shape
-                h_hyperedge_base = torch.zeros(num_hyperedges, 2 * feature_dim, dtype=h_x_mean.dtype, device=h_x_mean.device)
+                #h_hyperedge_base = torch.zeros(num_hyperedges, 2 * feature_dim, dtype=h_x_mean.dtype, device=h_x_mean.device)
                 h_hyperedge_output = h_hyperedge_base
                 
                 # The final shape is [num_hyperedges, 2*n + e]
@@ -434,15 +387,25 @@ class Estimator(pl.LightningModule):
                     h_combined = torch.cat((h, h_hyperedge_output), dim=0)
 
                     edge_batch_index = batch_mapping.index_select(0, edge_index[0, :])
-                    hyperedge_batch_index = torch.cat([
-                        torch.full((len(h),), i, device=x.device, dtype=torch.long)
-                        for i, h in enumerate(batch.hyperedges)
+                    # hyperedge_batch_index = torch.cat([
+                    #     torch.full((len(h),), i, device=x.device, dtype=torch.long)
+                    #     for i, h in enumerate(batch.hyperedges)
+                    # ])
+                    hyperedge_batch_index = torch.cat([ 
+                        torch.full((len(graph_hypere),), i, device=x.device, dtype=torch.long)
+                        for i, graph_hypere in enumerate(batch.hyperedges)
                     ])
                     # print(edge_batch_index)
                     # print(hyperedge_batch_index)
                     combined_batch_index = torch.cat((edge_batch_index, hyperedge_batch_index), dim=0)
                     h = h_combined ; edge_batch_index = combined_batch_index
                 # ----------------------------------
+
+
+
+
+
+
 
             h = self.node_edge_mlp(h)
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
@@ -459,7 +422,8 @@ class Estimator(pl.LightningModule):
             if self.is_node_task:
                 h = h[dense_batch_index]
 
-        predictions = torch.flatten(self.output_mlp(torch.flatten(h, start_dim=1)))
+        #predictions = torch.flatten(self.output_mlp(torch.flatten(h, start_dim=1)))
+        predictions = self.output_mlp(torch.flatten(h, start_dim=1))
         return predictions
     
 
@@ -521,32 +485,36 @@ class Estimator(pl.LightningModule):
                     y = y[self.test_mask]
 
                 task_loss = F.cross_entropy(predictions, y)
+            per_target_losses = None
+            total_loss = task_loss
 
         elif self.task_type == "binary_classification":
             y = y.view(predictions.shape)
             task_loss = F.binary_cross_entropy_with_logits(predictions.float(), y.float())
+            per_target_losses = None
+            total_loss = task_loss
 
+        # else:
+        #     if self.regression_loss_fn == "mse":
+        #         task_loss = F.mse_loss(torch.flatten(predictions), torch.flatten(y.float()))
+        #     elif self.regression_loss_fn == "mae":
+        #         task_loss = F.l1_loss(predictions, y.float())
         else:
-                        # --- Add this section to print the tensor overview for regression ---
-            # print("\n--- Regression Loss Tensors Overview ---")
-            # print("Predictions:")
-            # print(f"  Shape: {predictions.shape}")
-            # print(f"  Number of elements: {predictions.numel()}")
-            # # Print the first 5 elements of the predictions tensor
-            # print("First 5 elements of predictions:", predictions[:5])
-            # print("\nTargets (y):")
-            # print(f"  Shape: {y.shape}")
-            # print(f"  Number of elements: {y.numel()}")
-            # print(y)
-            # print("---------------------------------------")
-
-
+            # Use reduction='none' to get the loss for each individual element
             if self.regression_loss_fn == "mse":
-                task_loss = F.mse_loss(torch.flatten(predictions), torch.flatten(y.float()))
+                elementwise_loss = F.mse_loss(predictions, y.float(), reduction='none')
             elif self.regression_loss_fn == "mae":
-                task_loss = F.l1_loss(torch.flatten(predictions), torch.flatten(y.float()))
+                elementwise_loss = F.l1_loss(predictions, y.float(), reduction='none')
+                
+            # per_target_losses will have shape [num_targets]
+            # We take the mean loss for each target over the entire batch
+            per_target_losses = elementwise_loss.mean(dim=0)
 
-        return task_loss, predictions, y
+            # total_loss is the mean of all per-target losses
+            total_loss = per_target_losses.mean()
+
+        return total_loss, per_target_losses, predictions, y
+        #return task_loss, predictions, y
 
 
     def _step(self, batch: torch.Tensor, step_type: str):
@@ -563,9 +531,20 @@ class Estimator(pl.LightningModule):
         num_max_items = torch.max(num_max_items).item()
         num_max_items = nearest_multiple_of_8(num_max_items + 1)
 
-        task_loss, predictions, y = self._batch_loss(
+        task_loss, per_target_losses, predictions, y = self._batch_loss(
             x, edge_index, y, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, step_type=step_type, batch=batch
         )
+
+        # --- Logging the individual losses for regression ---
+        if self.task_type == "regression" and self.linear_output_size > 1:
+            for idx, target_name in enumerate(self.target_names):
+                loss = per_target_losses[idx]
+                self.log(
+                    f"{step_type}_loss_{target_name}", 
+                    loss, 
+                    prog_bar=False, 
+                    batch_size=self.batch_size
+                )
 
         predictions = predictions.detach().squeeze()
 
@@ -620,38 +599,29 @@ class Estimator(pl.LightningModule):
 
 
     def _epoch_end_report(self, epoch_outputs, epoch_type):
-        def flatten_list_of_tensors(lst):
-            try:
-                return np.array([item.item() for sublist in lst for item in sublist])
-            except:
-                return torch.cat(lst, dim=0)
+        # The most robust way to combine tensors, regardless of batch_size
+        # or whether the output is single-target or multi-target
+        y_pred = torch.cat([item[0] for item in epoch_outputs], dim=0)
+        y_true = torch.cat([item[1] for item in epoch_outputs], dim=0)
 
-        if self.task_type == "regression":
-            y_pred = flatten_list_of_tensors([item[0] for item in epoch_outputs]).reshape(-1, self.linear_output_size)
-            y_true = flatten_list_of_tensors([item[1] for item in epoch_outputs]).reshape(-1, self.linear_output_size)
-        else:
-            if self.batch_size > 1:
-                y_pred = torch.cat([item[0] for item in epoch_outputs], dim=0)
-                y_true = torch.cat([item[1] for item in epoch_outputs], dim=0)
-            else:
-                y_pred = torch.cat([item[0].unsqueeze(0) for item in epoch_outputs], dim=0).squeeze()
-                y_true = torch.cat([item[1].unsqueeze(0) for item in epoch_outputs], dim=0).squeeze()
-
+        # y_pred and y_true should now have shape [total_samples, linear_output_size]
+        
+        # We need to make sure the scaler logic is also using the right shape
         if self.scaler:
             if self.linear_output_size > 1:
-                y_pred = self.scaler.inverse_transform(y_pred.reshape(-1, self.linear_output_size))
-                y_true = self.scaler.inverse_transform(y_true.reshape(-1, self.linear_output_size))
+                y_pred = self.scaler.inverse_transform(y_pred.cpu().reshape(-1, self.linear_output_size))
+                y_true = self.scaler.inverse_transform(y_true.cpu().reshape(-1, self.linear_output_size))
             else:
-                y_pred = self.scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
-                y_true = self.scaler.inverse_transform(y_true.reshape(-1, 1)).flatten()
+                y_pred = self.scaler.inverse_transform(y_pred.cpu().reshape(-1, 1)).flatten()
+                y_true = self.scaler.inverse_transform(y_true.cpu().reshape(-1, 1)).flatten()
+            
+            y_pred = torch.from_numpy(y_pred).to(self.device)
+            y_true = torch.from_numpy(y_true).to(self.device)
 
-            y_pred = torch.from_numpy(y_pred)
-            y_true = torch.from_numpy(y_true)
-
+        # Now, the rest of the logic can operate on correctly shaped tensors
         if self.task_type == "binary_classification" and self.linear_output_size > 1:
             y_true = y_true.detach().cpu().reshape(-1, self.linear_output_size).long()
             y_pred = y_pred.detach().cpu().reshape(-1, self.linear_output_size)
-
             metrics = get_cls_metrics_multilabel_pt(y_true, y_pred, self.linear_output_size)
 
             self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
@@ -661,7 +631,6 @@ class Estimator(pl.LightningModule):
 
         elif self.task_type == "binary_classification" and self.linear_output_size == 1:
             metrics = get_cls_metrics_binary_pt(y_true, y_pred)
-
             self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
             self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
             self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
@@ -669,7 +638,6 @@ class Estimator(pl.LightningModule):
 
         elif self.task_type == "multi_classification" and self.linear_output_size > 1:
             metrics = get_cls_metrics_multiclass_pt(y_true, y_pred, self.linear_output_size)
-
             self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
             self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
             self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
@@ -677,31 +645,147 @@ class Estimator(pl.LightningModule):
             self.log(f"{epoch_type} AP", metrics[4], batch_size=self.batch_size)
 
         elif self.task_type == "regression":
-            if self.linear_output_size != 11:
-                metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
+            if self.linear_output_size > 1 and self.target_names is not None:
+                # Loop over each target name and its corresponding column index
+                for idx, target_name in enumerate(self.target_names):
+                    # Extract predictions and true values for this specific target
+                    # No squeeze() is needed here since y_pred/y_true are already 2D
+                    target_y_pred = y_pred[:, idx]
+                    target_y_true = y_true[:, idx]
+                    
+                    # Calculate metrics for this single target
+                    metrics = get_regr_metrics_pt(target_y_true, target_y_pred)
 
-                self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
-                self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
-                self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
-                self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
-            else:
-                mae_avg = []
-                for idx in range(11):
-                    target_name = pept_struct_target_names[idx]
-                    metrics = get_regr_metrics_pt(y_true.squeeze()[:, idx], y_pred.squeeze()[:, idx])
-
-                    mae_avg.append(metrics["MAE"])
-
+                    # Log the individual metrics
                     self.log(f"{epoch_type} {target_name} R2", metrics["R2"], batch_size=self.batch_size)
                     self.log(f"{epoch_type} {target_name} MAE", metrics["MAE"], batch_size=self.batch_size)
                     self.log(f"{epoch_type} {target_name} RMSE", metrics["RMSE"], batch_size=self.batch_size)
                     self.log(f"{epoch_type} {target_name} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
-
-                mae_avg = np.mean(np.array(mae_avg))
+                
+                # Calculate and log the average MAE across all targets
+                mae_values = [get_regr_metrics_pt(y_true[:, idx], y_pred[:, idx])["MAE"].cpu() for idx in range(self.linear_output_size)]
+                mae_avg = np.mean(np.array(mae_values))
                 self.log(f"{epoch_type} AVERAGE MAE", mae_avg, batch_size=self.batch_size)
-
-
+            
+            else:
+                metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
+                self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
+                self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
+                self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
+                self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
+        
         return metrics, y_pred, y_true
+    
+
+        # def flatten_list_of_tensors(lst):
+        #     try:
+        #         return np.array([item.item() for sublist in lst for item in sublist])
+        #     except:
+        #         return torch.cat(lst, dim=0)
+
+        # if self.task_type == "regression":
+        #     y_pred = flatten_list_of_tensors([item[0] for item in epoch_outputs]).reshape(-1, self.linear_output_size)
+        #     y_true = flatten_list_of_tensors([item[1] for item in epoch_outputs]).reshape(-1, self.linear_output_size)
+        # else:
+        #     if self.batch_size > 1:
+        #         y_pred = torch.cat([item[0] for item in epoch_outputs], dim=0)
+        #         y_true = torch.cat([item[1] for item in epoch_outputs], dim=0)
+        #     else:
+        #         y_pred = torch.cat([item[0].unsqueeze(0) for item in epoch_outputs], dim=0).squeeze()
+        #         y_true = torch.cat([item[1].unsqueeze(0) for item in epoch_outputs], dim=0).squeeze()
+
+        # if self.scaler:
+        #     if self.linear_output_size > 1:
+        #         y_pred = self.scaler.inverse_transform(y_pred.reshape(-1, self.linear_output_size))
+        #         y_true = self.scaler.inverse_transform(y_true.reshape(-1, self.linear_output_size))
+        #     else:
+        #         y_pred = self.scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
+        #         y_true = self.scaler.inverse_transform(y_true.reshape(-1, 1)).flatten()
+
+        #     y_pred = torch.from_numpy(y_pred)
+        #     y_true = torch.from_numpy(y_true)
+
+        # if self.task_type == "binary_classification" and self.linear_output_size > 1:
+        #     y_true = y_true.detach().cpu().reshape(-1, self.linear_output_size).long()
+        #     y_pred = y_pred.detach().cpu().reshape(-1, self.linear_output_size)
+
+        #     metrics = get_cls_metrics_multilabel_pt(y_true, y_pred, self.linear_output_size)
+
+        #     self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} F1", metrics[3], batch_size=self.batch_size)
+
+        # elif self.task_type == "binary_classification" and self.linear_output_size == 1:
+        #     metrics = get_cls_metrics_binary_pt(y_true, y_pred)
+
+        #     self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} F1", metrics[3], batch_size=self.batch_size)
+
+        # elif self.task_type == "multi_classification" and self.linear_output_size > 1:
+        #     metrics = get_cls_metrics_multiclass_pt(y_true, y_pred, self.linear_output_size)
+
+        #     self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} F1", metrics[3], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} AP", metrics[4], batch_size=self.batch_size)
+
+        # elif self.task_type == "regression":
+        #     if self.linear_output_size > 1 and self.target_names is not None:
+        #     # --- START of changed code ---
+        #     # Loop over each target name and its corresponding column index
+        #         for idx, target_name in enumerate(self.target_names):
+                    
+        #             # Extract predictions and true values for this specific target
+        #             target_y_pred = y_pred.squeeze()[:, idx]
+        #             target_y_true = y_true.squeeze()[:, idx]
+                    
+        #             # Calculate metrics for this single target
+        #             metrics = get_regr_metrics_pt(target_y_true, target_y_pred)
+
+        #             # Log the individual metrics
+        #             self.log(f"{epoch_type} {target_name} R2", metrics["R2"], batch_size=self.batch_size)
+        #             self.log(f"{epoch_type} {target_name} MAE", metrics["MAE"], batch_size=self.batch_size)
+        #             self.log(f"{epoch_type} {target_name} RMSE", metrics["RMSE"], batch_size=self.batch_size)
+        #             self.log(f"{epoch_type} {target_name} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
+                
+        #         # Calculate and log the average MAE across all targets
+        #         mae_values = [get_regr_metrics_pt(y_true.squeeze()[:, idx], y_pred.squeeze()[:, idx])["MAE"] for idx in range(self.linear_output_size)]
+        #         mae_avg = np.mean(np.array(mae_values))
+        #         self.log(f"{epoch_type} AVERAGE MAE", mae_avg, batch_size=self.batch_size)
+        #         # --- END of changed code ---
+            
+        #     # if self.linear_output_size != 11:
+        #     #     metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
+
+        #     #     self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
+        #     #     self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
+        #     #     self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
+        #     #     self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
+        #     else:
+        #         metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
+        #         self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
+        #         self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
+        #         self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
+        #         self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
+        #         # mae_avg = []
+        #         # for idx in range(11):
+        #         #     target_name = pept_struct_target_names[idx]
+        #         #     metrics = get_regr_metrics_pt(y_true.squeeze()[:, idx], y_pred.squeeze()[:, idx])
+
+        #         #     mae_avg.append(metrics["MAE"])
+
+        #         #     self.log(f"{epoch_type} {target_name} R2", metrics["R2"], batch_size=self.batch_size)
+        #         #     self.log(f"{epoch_type} {target_name} MAE", metrics["MAE"], batch_size=self.batch_size)
+        #         #     self.log(f"{epoch_type} {target_name} RMSE", metrics["RMSE"], batch_size=self.batch_size)
+        #         #     self.log(f"{epoch_type} {target_name} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
+
+        #         # mae_avg = np.mean(np.array(mae_avg))
+        #         # self.log(f"{epoch_type} AVERAGE MAE", mae_avg, batch_size=self.batch_size)
+        # return metrics, y_pred, y_true
 
 
     def on_train_epoch_end(self):
@@ -748,58 +832,70 @@ class Estimator(pl.LightningModule):
 
 
 
-                # hyperedge_nodes_flat = torch.tensor(list(itertools.chain.from_iterable(batch.hyperedges)), 
-                #                     device=x.device, 
-                #                     dtype=torch.long)
+# def find_max_robust(nested_list):
+#     """
+#     Finds the maximum integer in a nested list of any shape.
+#     This is a more robust solution than using fixed nested loops.
 
-                # # hyperedge_nodes_flat = torch.tensor(
-                # #     list(itertools.chain.from_iterable(itertools.chain.from_iterable(batch.hyperedges))), 
-                # #     device=x.device, 
-                # #     dtype=torch.long
-                # # )
+#     Args:
+#         nested_list (list): The list containing integers and/or other lists.
 
-                # # 2. Create an index map to group the nodes by hyperedge
-                # #    This tensor is the same size as `hyperedge_nodes_flat` and tells the scatter
-                # #    operation which hyperedge each node belongs to.
-                # hyperedge_index_map = torch.cat([
-                #     torch.full((len(h),), i, device=x.device, dtype=torch.long)
-                #     for i, h in enumerate(batch.hyperedges)
-                # ])
-                # # hyperedge_nodes_flat = torch.cat([torch.tensor(he, device=x.device, dtype=torch.long) for he in batch.hyperedges])
-                # # hyperedge_index_map = torch.cat([
-                # #     torch.full((len(h),), i, device=x.device, dtype=torch.long)
-                # #     for i, h in enumerate(batch.hyperedges)
-                # # ])
+#     Returns:
+#         int or None: The maximum integer found, or None if the list is empty.
+#     """
+#     # Use a list as a stack for an iterative, non-recursive approach
+#     stack = [nested_list]
+#     max_value = float('-inf')
+#     found_number = False
 
-                # # b) Compute the mean of node features for each hyperedge
-                # h_x_mean = torch_scatter.scatter_mean(x[hyperedge_nodes_flat], hyperedge_index_map, dim=0)
-                # c) Replicate the features to simulate a 'source' and 'target' # This creates a tensor of shape [num_hyperedges, 2*n]
+#     while stack:
+#         current_item = stack.pop()
 
+#         if isinstance(current_item, list):
+#             # If the item is a list, extend the stack with its contents
+#             stack.extend(current_item)
+#         elif isinstance(current_item, (int, float)):
+#             # If the item is a number, compare and update the maximum
+#             if current_item > max_value:
+#                 max_value = current_item
+#             found_number = True
+#         # Ignore other data types for this specific task
 
-
-                                # first_node_idx = batch.hyperedges[0][0]
-                # print(first_node_idx, "first node idx")
-                # # Get the feature from the main node feature tensor `x`
-                # feature_from_x = x[first_node_idx, :]
-                # print(f"Feature from x at index {first_node_idx} (main tensor) is: {feature_from_x[:5]}")
-                # print(f"Batch has {len(batch.hyperedges)} hyperedges in total.")
-                # num_graphs = len(batch.hyperedges)
-                # print("there") # 5 graphs, diiff numbers of hyperedges, with diff number of nodes inside.
-                # print(batch.hyperedges[:5])  # Print first 5 hyperedges to check structure
-                # print("max in batch hyperedges index", find_max_robust(batch.hyperedges))
-                # print("number in batch hyperedges index", count_unique_integers(batch.hyperedges))
+#     if not found_number:
+#         return None
+        
+#     return max_value
 
 
+# def count_unique_integers(nested_list):
+#     """
+#     Counts the number of unique integers in a nested list of any shape.
 
-                                # # We iterate through the graphs in the batch
-                # for i in range(len(batch.hyperedges)):
-                #     graph_hyperedges = batch.hyperedges[i]
-                #     node_shift = batch.ptr[i]
-                #     for hyperedge_nodes in graph_hyperedges:
-                #         # Shift the node indices for the current hyperedge
-                #         shifted_nodes = [node + node_shift for node in hyperedge_nodes]
-                #         hyperedge_nodes_shifted.extend(shifted_nodes)
-                #         # Map these nodes to the current hyperedge ID
-                #         hyperedge_index_map.extend([current_hyperedge_id] * len(hyperedge_nodes))
-                #         current_hyperedge_id += 1
-                # Get the number of hyperedges per graph
+#     Args:
+#         nested_list (list): The list containing integers and/or other lists.
+
+#     Returns:
+#         int: The number of different integers found.
+#     """
+#     # Use a set to store unique integers.
+#     unique_integers = set()
+
+#     # Use a list as a stack for an iterative, non-recursive approach
+#     stack = [nested_list]
+
+#     while stack:
+#         current_item = stack.pop()
+
+#         if isinstance(current_item, list):
+#             # If the item is a list, extend the stack with its contents
+#             stack.extend(current_item)
+#         elif isinstance(current_item, int):
+#             # If the item is an integer, add it to the set.
+#             # The set automatically handles uniqueness.
+#             unique_integers.add(current_item)
+#         # Note: We are specifically looking for integers, so we will not add floats.
+#         # This can be easily changed by adding `float` to the `isinstance` check.
+
+#     print(f"The unique integers found are: {sorted(list(unique_integers))}")
+#     return len(unique_integers)
+

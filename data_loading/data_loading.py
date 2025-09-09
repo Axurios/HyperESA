@@ -9,6 +9,7 @@ from torch_geometric.data import Data, InMemoryDataset
 from torch.utils.data import random_split
 from sklearn.preprocessing import StandardScaler
 from tqdm.auto import tqdm
+from torch.utils.data import Subset
 
 from ogb.utils import smiles2graph
 from data_loading.pyg_molecular_datasets.qm9 import QM9 as CustomQM9
@@ -17,7 +18,7 @@ from data_loading.lrgb import PeptidesFunctionalDataset, PeptidesStructuralDatas
 from data_loading.graphgps_utils import join_dataset_splits
 from data_loading.transforms import *
 
-from data_loading.hypergraph_construction import draw_pyg_as_xgi, add_hyper_edges_to_dataset_no_vocab, add_one_random_subgroup_hyperedge
+from data_loading.hypergraph_construction import draw_pyg_as_xgi, add_hyper_edges_to_dataset_no_vocab, add_one_random_subgroup_hyperedge, AddChemHyperEdges
 
 from rdkit import RDLogger
 
@@ -111,7 +112,17 @@ MOLECULENET_MAX_ATOMIC_NUMBERS = {
     "BACE": 53,
     "BBBP": 53,
 }
-
+class TransformedDataset(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, transform):
+        self.base_dataset = base_dataset
+        self.transform = transform
+    
+    def __len__(self):
+        return len(self.base_dataset)
+    
+    def __getitem__(self, idx):
+        data = self.base_dataset[idx]
+        return self.transform(data)
 
 class CustomPyGDataset(InMemoryDataset):
     def __init__(self, data_list=None):
@@ -165,11 +176,21 @@ def filter_none(data):
 
 
 def scale_y_for_regression_task(train_data_list, num_tasks=1):
-    y_train = np.array([data.y.squeeze() for data in train_data_list], dtype=float).reshape(-1, num_tasks)
+    # # y_train = np.array([data.y.squeeze() for data in train_data_list], dtype=float).reshape(-1, num_tasks)
+    # y_train = np.array([data.y for data in train_data_list], dtype=float).reshape(-1, num_tasks)
 
+    # scaler = StandardScaler()
+    # scaler = scaler.fit(y_train)
+
+    # return scaler
+    y_tensors = [data.y for data in train_data_list]
+    # print(y_tensors)
+    y_train_tensor = torch.cat(y_tensors, dim=0)
+    y_train_np = y_train_tensor.numpy()
+    # print(y_train_np.shape)
+    y_train = y_train_np.reshape(-1, num_tasks)
     scaler = StandardScaler()
     scaler = scaler.fit(y_train)
-
     return scaler
 
 
@@ -396,11 +417,36 @@ def load_tudataset(dataset_name, download_dir, one_hot=True, **kwargs):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
     print("Loading QM9 dataset...")
     add_hyper_edges = kwargs.get("add_hyper_edges", False)
+
+    print("target names :", target_name)
+    if not isinstance(target_name, list):
+        target_name = [target_name]
+        print("turned into list")
+
+    target_indices = [QM9_TARGETS.index(name) for name in target_name]
+    
     transforms = [
-        SelectTarget(QM9_TARGETS.index(target_name)),
         ChempropFeatures(one_hot=one_hot, max_atomic_number=9),
         AddMaxEdge(),
         AddMaxNode(),
@@ -410,19 +456,21 @@ def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
         t_posenc = AddPosEnc(kwargs["pe_types"])
         transforms.append(t_posenc)
 
-    transforms.append(FormatSingleLabel())
 
-    dataset = CustomQM9(root=download_dir, pre_transform=T.Compose(transforms), pre_filter=filter_none)
+    dataset = CustomQM9(root=download_dir, pre_transform=T.Compose(transforms), pre_filter=filter_none) #" pre transform computed only once ..."
+    
+    print("Selecting target...")
+    select_transform = T.Compose([SelectTarget(target_indices)])    
+    dataset = [select_transform(data) for data in tqdm(dataset)]
+
 
     print("\nDataset items look like: ", dataset[0])
 
     print("Determining global node/edge counts...")
-
     max_edge_global, max_node_global = get_max_node_edge_global(dataset)
 
     print(f"Datasets has {len(dataset)} elements")
-    print(f"Maximum number of nodes per graph in dataset = {max_node_global}")
-    print(f"Maximum number of edges per graph in dataset = {max_edge_global}")
+    print(f"Maximum number of nodes per graph in dataset = {max_node_global}") ; print(f"Maximum number of edges per graph in dataset = {max_edge_global}")
 
     global_transforms = T.Compose([AddMaxEdgeGlobal(max_edge_global), AddMaxNodeGlobal(max_node_global)])
 
@@ -440,61 +488,51 @@ def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
     # --- New Logic Here ---
     if add_hyper_edges:
         print("HYPEREDGES TRUE")
-        first_train_idx = train.indices[5] ; first_train_data = dataset[first_train_idx] 
-        # random_train_idx = rd.choice(train.indices) ; random_train_data = dataset[random_train_idx]
-        #draw_pyg_as_xgi(first_train_data)
 
-        # add rd hyperedge to a new object copying the first graph, and draw the new objet
-        # data_with_hyperedge = first_train_data.clone() ; add_random_hyperedge(data_with_hyperedge, num_nodes_in_hyperedge=3)
-        #draw_pyg_as_xgi(data_with_hyperedge)
+        hyperedges_transform = T.Compose([AddChemHyperEdges()])          
+        # train_hyper = add_hyper_edges_to_dataset_no_vocab(train) ; val_hyper = add_hyper_edges_to_dataset_no_vocab(val) ; test_hyper = add_hyper_edges_to_dataset_no_vocab(test)
+        train_hyper = TransformedDataset(train.dataset, hyperedges_transform) ; val_hyper = TransformedDataset(val.dataset, hyperedges_transform) ; test_hyper = TransformedDataset(test.dataset, hyperedges_transform)
+        train_hyper = Subset(train_hyper, train.indices) ; val_hyper = Subset(val_hyper, val.indices) ; test_hyper = Subset(test_hyper, test.indices)
 
-        # Compute the subgraph vocabulary from the training set.
-        #print("Creating the hyperedges vocab from training set...")
-        #hyperedge_vocabulary = get_subgraph_vocabulary(train, num_hops=3)
-        draw_pyg_as_xgi(first_train_data)
-        single_graph_dataset = [first_train_data]
-        single_graph_hyper_dataset = add_hyper_edges_to_dataset_no_vocab(single_graph_dataset)
+        max_hyperedges = 0 ; max_hyper_data = None ; max_idx = -1
+        for idx, data in enumerate(tqdm(train_hyper)):
+            current_num_hyperedges = len(data.hyperedges)
+            if current_num_hyperedges > max_hyperedges:
+                max_hyperedges = current_num_hyperedges
+                max_hyper_data = data ; max_idx = idx
 
-        hyper_data_point = single_graph_hyper_dataset[0]
-        draw_pyg_as_xgi(hyper_data_point)
-        
-        # print("vocab hypergraph")
-        # single_graph_hyper_dataset = add_hyper_edges_to_dataset(single_graph_dataset, hyperedge_vocabulary, num_hops=3)
-        # hyper_data_point = single_graph_hyper_dataset[0]
-        
-        #; draw_pyg_as_xgi(hyper_data_point)
-        # if hasattr(hyper_data_point, 'hyperedges') and hyper_data_point.hyperedges:
-        #     print(f"Nombre d'hyperarêtes trouvées : {len(hyper_data_point.hyperedges)}")
-        #     for i, hyperedge in enumerate(hyper_data_point.hyperedges):
-        #         print(f"  Hyperarête {i+1} : {hyperedge}")
-        # else:
-        #     print("Aucune hyperarête n'a été ajoutée à ce graphe.")
-
-
-        #print("Adding hyper_edges from vocab to each graph...")
-        # train_hyper = add_one_random_subgroup_hyperedge(train)
-        # val_hyper = add_one_random_subgroup_hyperedge(val)
-        # test_hyper = add_one_random_subgroup_hyperedge(test)
-        train_hyper = add_hyper_edges_to_dataset_no_vocab(train)
-        val_hyper = add_hyper_edges_to_dataset_no_vocab(val)
-        test_hyper = add_hyper_edges_to_dataset_no_vocab(test)
+        print(f"Max hyperedges found: {max_hyperedges}") ; print(max_hyper_data.hyperedges)
+        normal_graph_data = train[max_idx]
+        draw_pyg_as_xgi(normal_graph_data) ; draw_pyg_as_xgi(max_hyper_data)
 
         train = train_hyper ; val = val_hyper ; test = test_hyper
     # ----------------------
 
     print("Scaling dataset y values...")
-    y_scaler = scale_y_for_regression_task(train)
+    num_classes = len(target_indices)
+    y_scaler = scale_y_for_regression_task(train, num_tasks=num_classes)
 
-    train = subset_to_pyg_dataset(train, scaler=y_scaler)
-    val = subset_to_pyg_dataset(val, scaler=y_scaler)
-    test = subset_to_pyg_dataset(test, scaler=y_scaler)
+    train = subset_to_pyg_dataset(train, scaler=y_scaler, num_tasks=num_classes) ; val = subset_to_pyg_dataset(val, scaler=y_scaler, num_tasks=num_classes) ; test = subset_to_pyg_dataset(test, scaler=y_scaler, num_tasks=num_classes)
 
     print("Finished loading data!")
-
-    num_classes = 1
     task_type = "regression"
 
     return train, val, test, num_classes, task_type, y_scaler
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def load_moleculenet_chemprop(dataset_name, download_dir, one_hot, **kwargs):
@@ -1146,3 +1184,73 @@ def get_dataset_train_val_test_with_indices_for_graphgps_node(dataset, dataset_d
     # Train, val, test masks are attributes of the train object
     train, val, test, num_classes, task_type, scaler, train_mask, val_mask, test_mask = get_dataset_train_val_test(dataset, dataset_dir, **kwargs)
     return train, scaler
+
+
+
+
+
+
+
+
+            # print("vocab hypergraph")
+        # single_graph_hyper_dataset = add_hyper_edges_to_dataset(single_graph_dataset, hyperedge_vocabulary, num_hops=3)
+        # hyper_data_point = single_graph_hyper_dataset[0]
+        
+        #; draw_pyg_as_xgi(hyper_data_point)
+        # if hasattr(hyper_data_point, 'hyperedges') and hyper_data_point.hyperedges:
+        #     print(f"Nombre d'hyperarêtes trouvées : {len(hyper_data_point.hyperedges)}")
+        #     for i, hyperedge in enumerate(hyper_data_point.hyperedges):
+        #         print(f"  Hyperarête {i+1} : {hyperedge}")
+        # else:
+        #     print("Aucune hyperarête n'a été ajoutée à ce graphe.")
+
+
+        #print("Adding hyper_edges from vocab to each graph...")
+        # train_hyper = add_one_random_subgroup_hyperedge(train)
+        # val_hyper = add_one_random_subgroup_hyperedge(val)
+        # test_hyper = add_one_random_subgroup_hyperedge(test)
+
+
+
+                # random_train_idx = rd.choice(train.indices) ; random_train_data = dataset[random_train_idx]
+        #draw_pyg_as_xgi(first_train_data)
+
+        # add rd hyperedge to a new object copying the first graph, and draw the new objet
+        # data_with_hyperedge = first_train_data.clone() ; add_random_hyperedge(data_with_hyperedge, num_nodes_in_hyperedge=3)
+        #draw_pyg_as_xgi(data_with_hyperedge)
+
+        # Compute the subgraph vocabulary from the training set.
+        #print("Creating the hyperedges vocab from training set...")
+        #hyperedge_vocabulary = get_subgraph_vocabulary(train, num_hops=3)
+
+
+
+                # dataset = [hyperedges_transform(data) for data in tqdm(dataset)]
+        # first_train_idx = train.indices[5] ; first_train_data = dataset[first_train_idx] 
+        
+        # draw_pyg_as_xgi(first_train_data)
+        # single_graph_dataset = [first_train_data]
+        # single_graph_hyper_dataset = [hyperedges_transform(data) for data in tqdm(single_graph_dataset)]
+        # # single_graph_hyper_dataset = add_hyper_edges_to_dataset_no_vocab(single_graph_dataset)
+
+        # hyper_data_point = single_graph_hyper_dataset[0]
+        # draw_pyg_as_xgi(hyper_data_point)
+        # ## ---------------------
+        # max_hyperedges = 0
+        # max_hyper_data = None
+
+        # for data in tqdm(train_hyper):
+        #     # Replace the following line with your actual way of getting the number of hyperedges
+        #     current_num_hyperedges = len(data.hyperedges)  # example attribute, adjust as needed
+            
+        #     if current_num_hyperedges > max_hyperedges:
+        #         max_hyperedges = current_num_hyperedges
+        #         max_hyper_data = data
+
+        # print(f"Max hyperedges found: {max_hyperedges}")
+        # draw_pyg_as_xgi(max_hyper_data)
+
+        # idx = train_hyper.index(max_hyper_data)
+        # normal_graph_data = train[idx]
+
+        # draw_pyg_as_xgi(normal_graph_data)

@@ -156,17 +156,62 @@ class Add3DOrPosAsNodeFeatures(T.BaseTransform):
             data.x = torch.cat((data.pos, data.x), dim=-1)
         return data
 
+# class SelectTarget(T.BaseTransform):
+#     def __init__(self, target_ids):
+#         if not isinstance(target_ids, list):
+#             target_ids = [target_ids]
+#         self.target_ids = target_ids
+
+#     def forward(self, data):
+#         #data.y = data.y[:, self.target_ids].squeeze(0)
+#         # now data.y is shape (len(target_ids),)
+#         return data
 
 class SelectTarget(T.BaseTransform):
     def __init__(self, target_id):
         self.target_id = target_id
 
     def forward(self, data):
+        #print(data.y.ndim, "DATA Y NDIM")
+        #print(data.y.shape, "DATA Y SHAPE")
         if data.y.ndim == 2:
-            data.y = data.y[:, self.target_id].squeeze()
+            #print("Selecting target id:", self.target_id)
+            data.y = data.y[:, self.target_id]
+            # print(data.y.shape, "NEW DATA Y SHAPE")
         elif data.y.ndim == 1:
             data.y = data.y[self.target_id].squeeze()
         return data
+
+# class SelectTarget(T.BaseTransform):
+#     def __init__(self, target_ids):
+#         if not isinstance(target_ids, list):
+#             target_ids = [target_ids]
+#         self.target_ids = target_ids
+#         #self.target_id = target_id
+
+#     def forward(self, data):
+#         data.y = data.y[:, self.target_ids]
+#         print(data.y.shape)
+#         # if data.y.ndim == 2:
+#         #     data.y = data.y[:, self.target_id].squeeze()
+#         # elif data.y.ndim == 1:
+#         #     data.y = data.y[self.target_id].squeeze()
+#         return data
+    
+#     def __repr__(self) -> str:
+#         return f'{self.__class__.__name__}(target_ids={self.target_ids})'
+    
+
+# class SelectTarget(T.BaseTransform):
+#     def __init__(self, target_id):
+#         self.target_id = target_id
+
+#     def forward(self, data):
+#         if data.y.ndim == 2:
+#             data.y = data.y[:, self.target_id].squeeze()
+#         elif data.y.ndim == 1:
+#             data.y = data.y[self.target_id].squeeze()
+#         return data
 
 
 class OneHotInt(T.BaseTransform):
@@ -255,6 +300,17 @@ class AddMaxDegree(T.BaseTransform):
         return data
 
 
+# class FormatSingleLabel(T.BaseTransform):
+#     def forward(self, data):
+#         # if data is None:
+#         #     return data
+
+#         # if data.y.ndim == 0:
+#         #     data.y = data.y.unsqueeze(0)
+#         # elif data.y.ndim == 2:
+#         #     data.y = data.y.squeeze(1)
+
+#         return data
 class FormatSingleLabel(T.BaseTransform):
     def forward(self, data):
         if data is None:
@@ -266,6 +322,64 @@ class FormatSingleLabel(T.BaseTransform):
             data.y = data.y.squeeze(1)
 
         return data
+
+# class FormatSingleLabel(T.BaseTransform):
+#     def forward(self, data):
+#         # if data is None:
+        #     return data
+
+        # if data.y.ndim == 1:
+        #     data.y = data.y.unsqueeze(0)
+
+        # if data.y.ndim == 0:
+        #     data.y = data.y.unsqueeze(0).unsqueeze(0)
+  
+        # elif data.y.ndim == 1:
+        #     data.y = data.y.unsqueeze(0)
+
+        # if data.y.ndim == 1 and data.y.shape[0] > 0:
+        #     data.y = data.y.unsqueeze(1)
+        
+        # # If you have a single sample with a single target, you'll get a scalar.
+        # if data.y.ndim == 0:
+        #      data.y = data.y.unsqueeze(0).unsqueeze(0)
+        return data
+
+
+# class EnsureYShape(BaseTransform):
+#     def __init__(self, num_tasks):
+#         self.num_tasks = num_tasks
+
+#     def forward(self, data: Data) -> Data:
+#         # Ensure y is a tensor and has the correct shape [num_tasks]
+#         if not isinstance(data.y, torch.Tensor):
+#             data.y = torch.tensor(data.y, dtype=torch.float)
+
+#         # Reshape the tensor to ensure it has [num_tasks] elements
+#         # This handles cases where y might be a scalar or a [1] tensor
+#         data.y = data.y.reshape(self.num_tasks)
+        
+#         return data
+
+#     def __repr__(self) -> str:
+#         return f'{self.__class__.__name__}(num_tasks={self.num_tasks})'
+
+# class EnsureYShape(BaseTransform):
+#     def __init__(self, num_tasks):
+#         self.num_tasks = num_tasks
+
+#     def forward(self, data: Data) -> Data:
+#         # Ensure y is a tensor and has the correct shape
+#         if not isinstance(data.y, torch.Tensor):
+#             data.y = torch.tensor(data.y, dtype=torch.float)
+
+#         # --- THIS IS THE CORRECTED LINE ---
+#         # Reshape the tensor to ensure it is 2D with one row
+#         data.y = data.y.reshape(1, self.num_tasks)
+#         return data
+
+#     def __repr__(self) -> str:
+#         return f'{self.__class__.__name__}(num_tasks={self.num_tasks})'
 
 
 class LabelNanToZero(T.BaseTransform):
