@@ -489,7 +489,8 @@ def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
     if add_hyper_edges:
         print("HYPEREDGES TRUE")
 
-        hyperedges_transform = T.Compose([AddChemHyperEdges()])          
+        hyperedges_transform = T.Compose([AddChemHyperEdges()])
+        #hyperedges_transform = T.Compose([AddEmptyHyperEdges()])       
         # train_hyper = add_hyper_edges_to_dataset_no_vocab(train) ; val_hyper = add_hyper_edges_to_dataset_no_vocab(val) ; test_hyper = add_hyper_edges_to_dataset_no_vocab(test)
         train_hyper = TransformedDataset(train.dataset, hyperedges_transform) ; val_hyper = TransformedDataset(val.dataset, hyperedges_transform) ; test_hyper = TransformedDataset(test.dataset, hyperedges_transform)
         train_hyper = Subset(train_hyper, train.indices) ; val_hyper = Subset(val_hyper, val.indices) ; test_hyper = Subset(test_hyper, test.indices)

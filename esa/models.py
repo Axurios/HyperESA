@@ -336,79 +336,40 @@ class Estimator(pl.LightningModule):
                 h = torch.cat((h, edge_attr.float()), dim=1)
             edge_batch_index = batch_mapping.index_select(0, edge_index[0, :])
 
-
-
-
-
-
-            # ----------------- HYPEREDGES -----------------
+            # print("there")
             h_hyperedge_output = None
             if self.use_hyperedges and hasattr(batch, 'hyperedges') and batch.hyperedges:
-                total_hyperedges = sum(len(graph_hyperedges) for graph_hyperedges in batch.hyperedges)
-                hyperedge_nodes_shifted = [] ; hyperedge_index_map = []
-                hyperedge_nodes_shifted_list = [] ; hyperedge_index_map_list = []
-            
-                num_hyperedges_per_graph = torch.tensor([len(g_h) for g_h in batch.hyperedges], device=x.device, dtype=torch.long)
-                hyperedge_id_shifts = torch.cumsum(num_hyperedges_per_graph, dim=0)
-                hyperedge_id_shifts = torch.cat([torch.tensor([0], device=x.device), hyperedge_id_shifts[:-1]])
-                for i in range(len(batch.hyperedges)):
-                    graph_hyperedges = batch.hyperedges[i] ; node_shift = batch.ptr[i]
-                    if not graph_hyperedges:
-                        continue
-                    flat_nodes = torch.tensor([node for h_nodes in graph_hyperedges for node in h_nodes], device=x.device, dtype=torch.long)
-                    shifted_nodes = flat_nodes + node_shift
-                    hyperedge_nodes_shifted_list.append(shifted_nodes)
-                    
-                    hyperedge_lengths = torch.tensor([len(h_nodes) for h_nodes in graph_hyperedges], device=x.device, dtype=torch.long)
-                    hyperedge_ids = torch.arange(len(graph_hyperedges), device=x.device, dtype=torch.long) + hyperedge_id_shifts[i]
-                    hyperedge_index_map_list.append(torch.repeat_interleave(hyperedge_ids, hyperedge_lengths))
-                    
-                hyperedge_nodes_shifted = torch.cat(hyperedge_nodes_shifted_list, dim=0)
-                hyperedge_index_map = torch.cat(hyperedge_index_map_list, dim=0)
+                ptr = batch.ptr.to(x.device)
+                all_hyperedges = [torch.tensor(hed, dtype=torch.long, device=x.device)  + ptr[g] for g, gra in enumerate(batch.hyperedges) for hed in gra]
 
-                #hyperedge_nodes_shifted = torch.tensor(hyperedge_nodes_shifted, device=x.device, dtype=torch.long)
-                #hyperedge_index_map = torch.tensor(hyperedge_index_map, device=x.device, dtype=torch.long)
-                h_x_mean = torch_scatter.scatter_mean(x[hyperedge_nodes_shifted], hyperedge_index_map, dim=0)  # Now perform the scatter operation with the correctly shifted indices
+                hedge_nodes_tensor = torch.nn.utils.rnn.pad_sequence(all_hyperedges, batch_first=True, padding_value=-1)
+                mask = hedge_nodes_tensor != -1 ; valid_indices = hedge_nodes_tensor.clone() ; valid_indices[~mask] = 0 
+                features = x[valid_indices] ; features = features * mask.unsqueeze(-1)
 
-                h_hyperedge_base = torch.cat((h_x_mean, h_x_mean), dim=1) # print(h_hyperedge_base.shape)
-                # num_hyperedges = h_x_mean.shape[0]
-                # feature_dim = h_x_mean.shape[1]
+                h_x_mean = features.sum(dim=1) / mask.sum(dim=1, keepdim=True)
+                h_hyperedge_output = torch.cat((h_x_mean, h_x_mean), dim=1)
 
-                # Create a new tensor of zeros with the desired shape
-                #h_hyperedge_base = torch.zeros(num_hyperedges, 2 * feature_dim, dtype=h_x_mean.dtype, device=h_x_mean.device)
-                h_hyperedge_output = h_hyperedge_base
+                num_hyperedges_per_graph = [len(h) for h in batch.hyperedges] #; print("HYPEREDGES USED")
+                hedge_index = torch.repeat_interleave(torch.arange(len(batch.hyperedges), device=x.device), torch.tensor(num_hyperedges_per_graph, device=x.device))
                 
-                # The final shape is [num_hyperedges, 2*n + e]
-                if self.edge_dim is not None and edge_attr is not None:     
-                    hyperedge_attr_zeros = torch.zeros((total_hyperedges, self.edge_dim), device=x.device, dtype=x.dtype)
-                    h_hyperedge_output = torch.cat((h_hyperedge_base, hyperedge_attr_zeros), dim=1)
             
+                # The final shape is [num_hyperedges, 2*n + e]
+                if self.edge_dim is not None and edge_attr is not None:   
+                    total_hyperedges = sum(len(graph_hyperedges) for graph_hyperedges in batch.hyperedges) 
+                    hyperedge_attr_ones = torch.ones((total_hyperedges, self.edge_dim), device=x.device, dtype=x.dtype) # this might be the issue
+                    h_hyperedge_output = torch.cat((h_hyperedge_output, hyperedge_attr_ones), dim=1)
+                
+
                 if h_hyperedge_output is not None:
                     h_combined = torch.cat((h, h_hyperedge_output), dim=0)
-
                     edge_batch_index = batch_mapping.index_select(0, edge_index[0, :])
-                    # hyperedge_batch_index = torch.cat([
-                    #     torch.full((len(h),), i, device=x.device, dtype=torch.long)
-                    #     for i, h in enumerate(batch.hyperedges)
-                    # ])
-                    hyperedge_batch_index = torch.cat([ 
-                        torch.full((len(graph_hypere),), i, device=x.device, dtype=torch.long)
-                        for i, graph_hypere in enumerate(batch.hyperedges)
-                    ])
-                    # print(edge_batch_index)
-                    # print(hyperedge_batch_index)
-                    combined_batch_index = torch.cat((edge_batch_index, hyperedge_batch_index), dim=0)
+                    combined_batch_index = torch.cat((edge_batch_index, hedge_index), dim=0)
                     h = h_combined ; edge_batch_index = combined_batch_index
-                # ----------------------------------
-
-
-
-
-
 
 
             h = self.node_edge_mlp(h)
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
+            # edge_index unchanged, not the same as h dimension ???
             h = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items)
 
 
@@ -899,3 +860,49 @@ class Estimator(pl.LightningModule):
 #     print(f"The unique integers found are: {sorted(list(unique_integers))}")
 #     return len(unique_integers)
 
+            # # ----------------- HYPEREDGES -----------------
+            # # h_hyperedge_output = None
+            # # if self.use_hyperedges and hasattr(batch, 'hyperedges') and batch.hyperedges:
+                
+            #     if total_hyperedges == 0:
+            #         print("no hyperedges ???")
+            #         pass
+            #     total_hyperedges = sum(len(graph_hyperedges) for graph_hyperedges in batch.hyperedges)
+            #     hyperedge_nodes_shifted = [] ; hyperedge_index_map = []
+            #     hyperedge_nodes_shifted_list = [] ; hyperedge_index_map_list = []
+            
+            #     num_hyperedges_per_graph = torch.tensor([len(g_h) for g_h in batch.hyperedges], device=x.device, dtype=torch.long)
+            #     hyperedge_id_shifts = torch.cumsum(num_hyperedges_per_graph, dim=0)
+            #     hyperedge_id_shifts = torch.cat([torch.tensor([0], device=x.device), hyperedge_id_shifts[:-1]])
+            #     for i in range(len(batch.hyperedges)):
+            #         graph_hyperedges = batch.hyperedges[i] ; node_shift = batch.ptr[i]
+            #         if not graph_hyperedges:
+            #             continue
+            #         flat_nodes = torch.tensor([node for h_nodes in graph_hyperedges for node in h_nodes], device=x.device, dtype=torch.long)
+            #         shifted_nodes = flat_nodes + node_shift
+            #         hyperedge_nodes_shifted_list.append(shifted_nodes)
+                    
+            #         hyperedge_lengths = torch.tensor([len(h_nodes) for h_nodes in graph_hyperedges], device=x.device, dtype=torch.long)
+            #         hyperedge_ids = torch.arange(len(graph_hyperedges), device=x.device, dtype=torch.long) + hyperedge_id_shifts[i]
+            #         hyperedge_index_map_list.append(torch.repeat_interleave(hyperedge_ids, hyperedge_lengths))
+                    
+            #     hyperedge_nodes_shifted = torch.cat(hyperedge_nodes_shifted_list, dim=0)
+            #     hyperedge_index_map = torch.cat(hyperedge_index_map_list, dim=0)
+
+            #     h_x_mean = torch_scatter.scatter_mean(x[hyperedge_nodes_shifted], hyperedge_index_map, dim=0)  # Now perform the scatter operation with the correctly shifted indices
+
+
+                # print("Type of all_hyperedges:", type(all_hyperedges)) # list
+                # print("Type of all_hyperedges[0]:", type(all_hyperedges[0])) # tensor
+                # print(len(all_hyperedges), "length of all_hyperedges list") # (should be Eh, the total number of hyperedges in the batch)
+                # print(all_hyperedges[0].shape)
+                # print(all_hyperedges[1].shape) 
+
+
+
+
+
+                    # hyperedge_batch_index = torch.cat([ 
+                    #     torch.full((len(graph_hyperedge),), i, device=x.device, dtype=torch.long)
+                    #     for i, graph_hyperedge in enumerate(batch.hyperedges)
+                    # ])

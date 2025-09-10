@@ -144,7 +144,7 @@ class QM9(InMemoryDataset):
                  pre_filter: Optional[Callable] = None):
         super().__init__(root, transform, pre_transform, pre_filter)
         self.data, self.slices = torch.load(self.processed_paths[0])
-        print(self.data.y.shape, "DATA Y SHAPE")
+        # print(self.data.y.shape, "DATA Y SHAPE")
 
     def mean(self, target: int) -> float:
         y = torch.cat([self.get(i).y for i in range(len(self))], dim=0)

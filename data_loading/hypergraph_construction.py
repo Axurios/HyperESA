@@ -120,6 +120,34 @@ class AddChemHyperEdges(T.BaseTransform):
 
 
 
+def add_empty_hyper_edges_func(data):
+    """
+    Dummy hyperedge creator.
+    Always adds an empty hyperedge list to the PyG Data object.
+    """
+    data.hyperedges = [[]]
+    return data
+
+
+class AddEmptyHyperEdges(T.BaseTransform):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, data):
+        data = add_empty_hyper_edges_func(data)
+        return data
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -318,7 +346,10 @@ def draw_pyg_as_xgi(pyg_data_object, ax=None, layout_method='spring', **kwargs):
     
     # 3. Add the hyperedges to the hypergraph object
     if hasattr(pyg_data_object, 'hyperedges') and pyg_data_object.hyperedges:
-        H.add_edges_from(pyg_data_object.hyperedges)
+        valid_hyperedges = [he for he in pyg_data_object.hyperedges if len(he) > 0]
+        if valid_hyperedges:
+            H.add_edges_from(valid_hyperedges)
+        # H.add_edges_from(pyg_data_object.hyperedges)
     
     if ax is None:
         fig, ax = plt.subplots()
@@ -402,13 +433,13 @@ def draw_pyg_as_xgi(pyg_data_object, ax=None, layout_method='spring', **kwargs):
 
 
 
-def separated_dataset_to_model_compatible(dataset_with_hyperedges_field):
-    # create from the hyperedges fields, those h-edges features
-    # concatenate them to the edges ones
+# def separated_dataset_to_model_compatible(dataset_with_hyperedges_field):
+#     # create from the hyperedges fields, those h-edges features
+#     # concatenate them to the edges ones
 
-    # compute the adj of those hyperedges (linegraph)
-    # put info on the edges adj.  
-    pass
+#     # compute the adj of those hyperedges (linegraph)
+#     # put info on the edges adj.  
+#     pass
 
 
 
