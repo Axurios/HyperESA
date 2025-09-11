@@ -12,9 +12,7 @@ class MAB(nn.Module):
 
         self.xformers_or_torch_attn = xformers_or_torch_attn
 
-        self.dim_Q = dim_Q
-        self.dim_K = dim_K
-        self.dim_V = dim_V
+        self.dim_Q = dim_Q ; self.dim_K = dim_K ; self.dim_V = dim_V
 
         self.num_heads = num_heads
         self.dropout_p = dropout_p
@@ -48,12 +46,11 @@ class MAB(nn.Module):
     def forward(self, Q, K, adj_mask=None):
         batch_size = Q.size(0)
         E_total = self.dim_V
+
         assert E_total % self.num_heads == 0, "Embedding dim is not divisible by nheads"
         head_dim = E_total // self.num_heads
-
-        Q = self.fc_q(Q)
-        V = self.fc_v(K)
-        K = self.fc_k(K)
+        
+        Q = self.fc_q(Q) ; V = self.fc_v(K) ; K = self.fc_k(K)
 
         # Additional normalisation for queries/keys. See above
         # Q = self.ln_q(Q).to(torch.bfloat16)
@@ -64,10 +61,7 @@ class MAB(nn.Module):
         V = V.view(batch_size, -1, self.num_heads, head_dim)
 
         if self.xformers_or_torch_attn in ["torch"]:
-            Q = Q.transpose(1, 2)
-            K = K.transpose(1, 2)
-            V = V.transpose(1, 2)
-
+            Q = Q.transpose(1, 2) ; K = K.transpose(1, 2) ; V = V.transpose(1, 2)
 
         if adj_mask is not None:
             adj_mask = adj_mask.expand(-1, self.num_heads, -1, -1)

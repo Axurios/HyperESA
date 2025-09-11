@@ -70,6 +70,46 @@ def create_edge_adjacency_mask(edge_index, num_edges):
     return adjacency_mask
 
 
+
+def expand_hyperedge_adjacency_mask(hyperedge_index, edge_adj_matrix, edge_index, num_edges):
+    # initialization
+    num_hyperedges = hyperedge_index.size(0) ; total_num_edges = num_edges + num_hyperedges
+    expanded_adj = torch.zeros((total_num_edges, total_num_edges), dtype=torch.bool, device=edge_adj_matrix.device)
+    expanded_adj[:num_edges, :num_edges] = edge_adj_matrix
+    
+
+    # hyperedge - hyperedge connectivity
+    source_nodes = edge_index[0].long().flatten() ; target_nodes = edge_index[1].long().flatten()
+    sentinel = max(edge_index.max().item() + 2, hyperedge_index.max().item() + 2, source_nodes.max()+2, target_nodes.max()+2)  # A value that is not a valid node index
+    hed = hyperedge_index.clone() ; hed[hed == -1] = sentinel  # [H, K]
+    num_hyperedges, max_nodes = hed.shape # Create a mask of shape [H, N] where N = max node index + 1
+    num_nodes = sentinel + 1 
+
+    node_mask = torch.zeros((num_hyperedges, num_nodes), dtype=torch.bool, device=edge_adj_matrix.device)
+    node_mask.scatter_(1, hed, True) ; node_mask = node_mask[:, :-1]
+
+    node_mask_float = node_mask.float()   # [H, N] # Remove sentinel column so padding doesn't count as overlap
+    hyperedge_connectivity = ((node_mask_float @ node_mask_float.T) > 0).int()  # [H, H] True if any shared node # Compute hyperedge-hyperedge overlaps via matrix multiplication
+    hyperedge_connectivity.fill_diagonal_(0)  # Remove self-connections
+    expanded_adj[num_edges:, num_edges:] = hyperedge_connectivity
+
+
+    # edge - hyperedge connectivity
+    source_nodes = edge_index[0].long().flatten() ; target_nodes = edge_index[1].long().flatten()
+
+
+    edge_hyperedge_connectivity = ((node_mask[:, source_nodes] | node_mask[:, target_nodes]).T).int() # [E, H]
+    # edge_hyperedge_connectivity = (node_mask[:, source_nodes.T] | node_mask[:, target_nodes.T]).T  # [E, H] = edge connects to hyperedge if source or target node in hyperedge
+    expanded_adj[:num_edges, num_edges:] = edge_hyperedge_connectivity 
+    expanded_adj[num_edges:, :num_edges] = edge_hyperedge_connectivity.T  
+    # edge_to_hyper = node_mask[:, target_nodes.T].T  ; hyper_to_edge = node_mask[:, source_nodes.T] ; #expanded_adj[:num_edges, num_edges:] = edge_to_hyper ; expanded_adj[num_edges:, :num_edges] = hyper_to_edge
+    # need to check the diagonal by block aspect
+    return expanded_adj
+
+
+
+     
+
 def get_first_unique_index(t):
     # This is taken from Stack Overflow :)
     unique, idx, counts = torch.unique(t, sorted=True, return_inverse=True, return_counts=True)
@@ -150,16 +190,21 @@ def get_adj_mask_from_edge_index_edge(
     xformers_or_torch_attn,
     use_bfloat16=True,
     device="cuda:0",
+    is_using_hyperedges=False,
+    hyperedge_index=None,
+    hedge_batch_index=None,
 ):
     if xformers_or_torch_attn in ["torch"]:
         empty_mask_fill_value = False
-        mask_dtype = torch.bool
+        mask_dtype = torch.bool 
         edge_mask_fill_value = True
     else:
         empty_mask_fill_value = -99999
         mask_dtype = torch.bfloat16 if use_bfloat16 else torch.float32
         edge_mask_fill_value = 0
-
+    
+    # print(max_items, "max items")
+    # print(edge_index.shape[1], "edge index shape")
     adj_mask = torch.full(
         size=(batch_size, max_items, max_items),
         fill_value=empty_mask_fill_value,
@@ -169,8 +214,13 @@ def get_adj_mask_from_edge_index_edge(
     )
 
     edge_batch_mapping = batch_mapping.index_select(0, edge_index[0, :])
+    if is_using_hyperedges and hedge_batch_index is not None:
+        edge_batch_mapping = hedge_batch_index
 
     edge_adj_matrix = create_edge_adjacency_mask(edge_index, edge_index.shape[1])
+    if is_using_hyperedges and hyperedge_index is not None:
+        edge_adj_matrix = expand_hyperedge_adjacency_mask(hyperedge_index, edge_adj_matrix, edge_index, edge_index.shape[1])
+
 
     edge_batch_index_to_original_index = generate_consecutive_tensor(
         get_first_unique_index(edge_batch_mapping), edge_batch_mapping.shape[0]
@@ -188,10 +238,9 @@ def get_adj_mask_from_edge_index_edge(
         edge_batch_index_to_original_index.index_select(0, eam_nonzero[:, 1]),
     ] = edge_mask_fill_value
 
-
     if xformers_or_torch_attn in ["torch"]:
         adj_mask = ~adj_mask
-
+    
     adj_mask = adj_mask.unsqueeze(1)
     return adj_mask
 
@@ -302,23 +351,22 @@ class SABComplete(nn.Module):
         X, edge_index, batch_mapping, max_items, adj_mask = inp
 
         if self.pre_or_post == "pre":
-            X = self.norm(X)
-
+            X = self.norm(X) # also work when hyperedges in x
         if self.idx == 1:
             out_attn = self.sab(X, adj_mask)
         else:
             out_attn = self.sab(X, None)
-
+        
         if out_attn.shape[-1] != X.shape[-1]:
             X = self.proj_1(X)
-
+        
         if self.pre_or_post == "pre":
             out = X + out_attn
         
         if self.pre_or_post == "post":
             out = self.residual_attn(X, out_attn)
             out = self.norm(out)
-
+        
         if self.use_mlp:
             if self.pre_or_post == "pre":
                 out_mlp = self.norm_mlp(out)
@@ -334,7 +382,6 @@ class SABComplete(nn.Module):
 
         if self.residual_dropout > 0:
             out = F.dropout(out, p=self.residual_dropout)
-
         return out, edge_index, batch_mapping, max_items, adj_mask
 
 
@@ -642,7 +689,7 @@ class ESA(nn.Module):
             self.dim_pma = dim_pma
 
 
-    def forward(self, X, edge_index, batch_mapping, num_max_items):
+    def forward(self, X, edge_index, batch_mapping, num_max_items, is_using_hyperedges=False, hyperedge_index=None, hedge_batch_index=None,):
 
         if self.node_or_edge == "node":
             adj_mask = get_adj_mask_from_edge_index_node(
@@ -657,11 +704,18 @@ class ESA(nn.Module):
             adj_mask = get_adj_mask_from_edge_index_edge(
                 edge_index=edge_index,
                 batch_mapping=batch_mapping,
-                batch_size=X.shape[0],
+                batch_size=X.shape[0],  
                 max_items=self.set_max_items,
                 xformers_or_torch_attn=self.xformers_or_torch_attn,
                 use_bfloat16=self.use_bfloat16,
+                is_using_hyperedges=is_using_hyperedges,
+                hyperedge_index=hyperedge_index,
+                hedge_batch_index=hedge_batch_index,
             )
+        
+        # issue is when is_using_hyperedges, adj_mask contains the hyperedges connectivity, but the edge_index and the batch_mapping don't
+        # batch_mapping links node with graphs, so not an issue
+        # the true issue is edge_index which is only edges, not hyperedges
 
         enc, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask))
         if hasattr(self, "dim_pma") and self.dim_hidden[0] != self.dim_pma:

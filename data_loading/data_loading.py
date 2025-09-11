@@ -440,7 +440,10 @@ def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
     add_hyper_edges = kwargs.get("add_hyper_edges", False)
 
     print("target names :", target_name)
-    if not isinstance(target_name, list):
+    if target_name == ["all"]:
+        target_name = QM9_TARGETS
+        print("Using all targets")
+    elif not isinstance(target_name, list):
         target_name = [target_name]
         print("turned into list")
 

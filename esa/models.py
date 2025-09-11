@@ -336,8 +336,8 @@ class Estimator(pl.LightningModule):
                 h = torch.cat((h, edge_attr.float()), dim=1)
             edge_batch_index = batch_mapping.index_select(0, edge_index[0, :])
 
-            # print("there")
-            h_hyperedge_output = None
+
+            hedge_batch_index = None ; hedge_nodes_tensor = None ; h_hyperedge_output = None
             if self.use_hyperedges and hasattr(batch, 'hyperedges') and batch.hyperedges:
                 ptr = batch.ptr.to(x.device)
                 all_hyperedges = [torch.tensor(hed, dtype=torch.long, device=x.device)  + ptr[g] for g, gra in enumerate(batch.hyperedges) for hed in gra]
@@ -350,27 +350,26 @@ class Estimator(pl.LightningModule):
                 h_hyperedge_output = torch.cat((h_x_mean, h_x_mean), dim=1)
 
                 num_hyperedges_per_graph = [len(h) for h in batch.hyperedges] #; print("HYPEREDGES USED")
-                hedge_index = torch.repeat_interleave(torch.arange(len(batch.hyperedges), device=x.device), torch.tensor(num_hyperedges_per_graph, device=x.device))
+                hedge_batch_index = torch.repeat_interleave(torch.arange(len(batch.hyperedges), device=x.device), torch.tensor(num_hyperedges_per_graph, device=x.device))
                 
-            
                 # The final shape is [num_hyperedges, 2*n + e]
                 if self.edge_dim is not None and edge_attr is not None:   
                     total_hyperedges = sum(len(graph_hyperedges) for graph_hyperedges in batch.hyperedges) 
-                    hyperedge_attr_ones = torch.ones((total_hyperedges, self.edge_dim), device=x.device, dtype=x.dtype) # this might be the issue
+                    hyperedge_attr_ones = torch.zeros((total_hyperedges, self.edge_dim), device=x.device, dtype=x.dtype) # this might be the issue
                     h_hyperedge_output = torch.cat((h_hyperedge_output, hyperedge_attr_ones), dim=1)
-                
 
                 if h_hyperedge_output is not None:
-                    h_combined = torch.cat((h, h_hyperedge_output), dim=0)
-                    edge_batch_index = batch_mapping.index_select(0, edge_index[0, :])
-                    combined_batch_index = torch.cat((edge_batch_index, hedge_index), dim=0)
-                    h = h_combined ; edge_batch_index = combined_batch_index
+                    h = torch.cat((h, h_hyperedge_output), dim=0)
+                    edge_batch_index = torch.cat((edge_batch_index, hedge_batch_index), dim=0)
 
+                    perm = edge_batch_index.argsort()
+                    h = h[perm] ; edge_batch_index = edge_batch_index[perm]
 
             h = self.node_edge_mlp(h)
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
-            # edge_index unchanged, not the same as h dimension ???
-            h = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items)
+            # print(num_max_items, "num max items")
+            # print(h.shape)
+            h = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
 
 
         # NSA
@@ -383,7 +382,6 @@ class Estimator(pl.LightningModule):
             if self.is_node_task:
                 h = h[dense_batch_index]
 
-        #predictions = torch.flatten(self.output_mlp(torch.flatten(h, start_dim=1)))
         predictions = self.output_mlp(torch.flatten(h, start_dim=1))
         return predictions
     
@@ -486,11 +484,17 @@ class Estimator(pl.LightningModule):
 
         if self.apply_attention_on == "edge":
             num_max_items = max_edge
+            if self.use_hyperedges and hasattr(batch, 'hyperedges') and batch.hyperedges:
+                #edge_graph_idx = batch_mapping[edge_index[0]]  # map each edge to its graph
+                #num_edges_per_graph = torch.bincount(edge_graph_idx, minlength=batch.num_graphs)
+                num_hyperedges_per_graph = [len(h) for h in batch.hyperedges]
+                num_max_items += num_hyperedges_per_graph  #max([e + h for e, h in zip(num_edges_per_graph, num_hyperedges_per_graph)])
         else:
             num_max_items = max_node
 
         num_max_items = torch.max(num_max_items).item()
         num_max_items = nearest_multiple_of_8(num_max_items + 1)
+        # print(num_max_items, "num max items in _step")
 
         task_loss, per_target_losses, predictions, y = self._batch_loss(
             x, edge_index, y, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, step_type=step_type, batch=batch
@@ -499,6 +503,7 @@ class Estimator(pl.LightningModule):
         # --- Logging the individual losses for regression ---
         if self.task_type == "regression" and self.linear_output_size > 1:
             for idx, target_name in enumerate(self.target_names):
+                print(target_name)
                 loss = per_target_losses[idx]
                 self.log(
                     f"{step_type}_loss_{target_name}", 
