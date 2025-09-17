@@ -8,6 +8,10 @@ import wandb
 import numpy as np
 import pytorch_lightning as pl
 from pathlib import Path
+from tqdm.auto import tqdm
+
+# import signal
+# import threading
 
 from torch_geometric.seed import seed_everything
 from torch_geometric.loader import DataLoader as GeometricDataLoader
@@ -20,6 +24,7 @@ from pytorch_lightning.loggers import WandbLogger
 sys.path.append(os.path.realpath("."))  
 
 from esa.models import Estimator
+from esa.pESA_models import hEstimator
 from data_loading.data_loading import get_dataset_train_val_test
 from esa.config import (
     save_arguments_to_json,
@@ -107,9 +112,12 @@ def main():
     parser.add_argument("--config-json-path", type=str)
     parser.add_argument("--wandb-project-name", type=str)
     parser.add_argument("--wandb-id", type=str, default=None)
+    parser.add_argument("--offline", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--add-hyper-edges", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--use-hyperedges", default=False, action=argparse.BooleanOptionalAction)
-    
+
+    parser.add_argument("--train-missing-edge", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--train-hidden", default=False, action=argparse.BooleanOptionalAction)
 
     args = parser.parse_args()
 
@@ -153,6 +161,8 @@ def main():
     pre_or_post = argsdict["pre_or_post"]
     pma_residual_dropout = argsdict["pma_residual_dropout"]
     use_mlp_ln = argsdict["use_mlp_ln"] == "yes"
+
+
 
     if monitor_loss_name == "MCC" or "MCC" in monitor_loss_name:
         monitor_loss_name = "Validation MCC"
@@ -267,10 +277,14 @@ def main():
                 resume_id = None # Reset resume_id so WandB starts a new run
 
     # Logging
-    logger = WandbLogger(name=run_name, project=wandb_project_name, save_dir=output_save_dir, 
+    if argsdict.get("offline"):
+        logger = None
+        print("Running offline mode")
+    else :
+        logger = WandbLogger(name=run_name, project=wandb_project_name, save_dir=output_save_dir, 
                         id=resume_id, # Use the provided ID
                         resume="must" if resume_id else None
-    ) # Only resume if an ID is given
+        ) # Only resume if an ID is given
 
     # Callbacks
     monitor_mode = "max" if "MCC" in monitor_loss_name else "min"
@@ -304,8 +318,13 @@ def main():
 
     if dataset != "ocp":
         model_args |= dict(is_node_task=check_is_node_level_dataset(dataset))
-
-    model = Estimator(**model_args) if dataset != "ocp" else Estimator_OCP(**model_args)
+   
+    train_hidden = argsdict["train_missing"] 
+    if train_hidden:
+        print("using hidden estimator")
+        model = hEstimator(**model_args) if dataset != "ocp" else Estimator_OCP(**model_args)
+    else :
+        model = Estimator(**model_args) if dataset != "ocp" else Estimator_OCP(**model_args)
     model = model.cuda()
 
     trainer_args = dict(
@@ -326,48 +345,63 @@ def main():
     trainer = pl.Trainer(**trainer_args)
 
     try:
-        trainer.fit(
-            model=model, train_dataloaders=train_loader, val_dataloaders=[val_loader, test_loader], ckpt_path=ckpt_path
-        )
+        trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=[val_loader, test_loader], ckpt_path=ckpt_path)
     except KeyboardInterrupt:
+        # tqdm._instances.clear()
         print("\nTraining interrupted by user. Saving a temporary checkpoint...")
         trainer.save_checkpoint(f"{output_save_dir}/interrupted_checkpoint.ckpt")
         print("Temporary checkpoint saved.")
-        return  # Re-raise the exception to terminate the program
 
+        try :
+            tqdm._instances.clear()
+        except Exception:
+            pass
+        interrupted = True
+    else:
+        interrupted = False
+    finally:
+        
+    #   # Re-raise the exception to terminate the program
+        
+        # wandb.finish()
     # trainer.fit(
     #     model=model, train_dataloaders=train_loader, val_dataloaders=[val_loader, test_loader], ckpt_path=ckpt_path
     # )
-    max_memory_allocated = torch.cuda.max_memory_allocated()
-    max_memory_reserved = torch.cuda.max_memory_reserved()
+        max_memory_allocated = torch.cuda.max_memory_allocated()
+        max_memory_reserved = torch.cuda.max_memory_reserved()
 
-    print('Max memory allocated = ', max_memory_allocated * 1e-9)
-    print('Max memory reserved = ', max_memory_reserved * 1e-9)
+        print('Max memory allocated = ', max_memory_allocated * 1e-9)
+        print('Max memory reserved = ', max_memory_reserved * 1e-9)
 
-    np.save(os.path.join(output_save_dir, 'max_memory_allocated.npy'), max_memory_allocated)
-    np.save(os.path.join(output_save_dir, 'max_memory_reserved.npy'), max_memory_reserved)
-    
-    trainer.test(model=model, dataloaders=test_loader, ckpt_path="best")
+        np.save(os.path.join(output_save_dir, 'max_memory_allocated.npy'), max_memory_allocated)
+        np.save(os.path.join(output_save_dir, 'max_memory_reserved.npy'), max_memory_reserved)
+        
+        try:
+            torch.cuda.empty_cache()
+            trainer.test(model=model, dataloaders=test_loader, ckpt_path="best")
+        except Exception as e:
+            print(f"Testing failed: {e}")
+        # trainer.test(model=model, dataloaders=test_loader, ckpt_path="best")
 
-    # Save test metrics
-    preds_path = os.path.join(output_save_dir, "test_y_pred.npy")
-    true_path = os.path.join(output_save_dir, "test_y_true.npy")
-    metrics_path = os.path.join(output_save_dir, "test_metrics.npy")
+        # Save test metrics
+        preds_path = os.path.join(output_save_dir, "test_y_pred.npy")
+        true_path = os.path.join(output_save_dir, "test_y_true.npy")
+        metrics_path = os.path.join(output_save_dir, "test_metrics.npy")
 
-    np.save(preds_path, model.test_output)
-    np.save(true_path, model.test_true)
-    np.save(metrics_path, model.test_metrics)
+        np.save(preds_path, model.test_output)
+        np.save(true_path, model.test_true)
+        np.save(metrics_path, model.test_metrics)
 
-    wandb.save(preds_path)
-    wandb.save(true_path)
-    wandb.save(metrics_path)
-    wandb.save(config_json_path)
+        wandb.save(preds_path)
+        wandb.save(true_path)
+        wandb.save(metrics_path)
+        wandb.save(config_json_path)
 
-    # ckpt_paths = [str(p) for p in Path(output_save_dir).rglob("*.ckpt")]
-    # for cp in ckpt_paths:
-    #     wandb.save(cp)
+            # ckpt_paths = [str(p) for p in Path(output_save_dir).rglob("*.ckpt")]
+            # for cp in ckpt_paths:
+            #     wandb.save(cp)
 
-    wandb.finish()
+        wandb.finish()
 
 
 if __name__ == "__main__":

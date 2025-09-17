@@ -1,19 +1,18 @@
 import torch
 import math
 import numpy as np
-import pytorch_lightning as pl
 import bitsandbytes as bnb
-import itertools
+import pytorch_lightning as pl
+
 
 from torch import nn
 from torch.nn import functional as F
 from torch_geometric.utils import to_dense_batch, scatter, cumsum
 from collections import defaultdict
 from typing import Optional, List
-import torch_scatter
 
 from utils.norm_layers import BN, LN
-from esa.masked_layers import ESA
+from esa.masked_layers_hidden import ESA_hidden
 from esa.mlp_utils import SmallMLP, GatedMLPMulti
 
 from utils.reporting import (
@@ -38,7 +37,7 @@ def nearest_multiple_of_8(n):
 
 
 
-class Estimator(pl.LightningModule):
+class hEstimator(pl.LightningModule):
     def __init__(
         self,
         task_type: str,
@@ -279,7 +278,7 @@ class Estimator(pl.LightningModule):
             mlp_dropout=self.mlp_dropout,
         )
 
-        self.st_fast = ESA(**st_args)
+        self.st_fast_hidden = ESA_hidden(**st_args)
 
         #print(self.mlp_type)
         if self.mlp_type in ["standard", "gated_mlp"]:
@@ -315,84 +314,39 @@ class Estimator(pl.LightningModule):
         #     )
     
     
-    
-    # def mask_one_edge_per_graph(self, h, edge_batch_index):  # edge_batch_index maps each edge to its graph in the batch
-    #     num_graphs = edge_batch_index.max().item() + 1 # batch_size analog
-    #     h_masked = h.clone() ; masked_features = [] ; masked_indices = []
-    #     # print(h.shape, "h shape before masking") ;
-    #     #print(self.shared_masking_token, "shared masking token shape")
-        
-    #     for g in range(num_graphs):  # now the masking
-    #         edges_in_g = (edge_batch_index == g).nonzero(as_tuple=True)[0]
-    #         masked_edge = edges_in_g[torch.randint(len(edges_in_g), (1,))]  # choose one edge at random to mask
-    #         masked_indices.append(masked_edge.item())
-    #         masked_features.append(h[masked_edge]) # store original feature as target
-    #         h_masked[masked_edge] = self.shared_masking_token  # replace with mask token
-    
-    #     masked_features = torch.cat(masked_features, dim=0)
-    #     return h_masked, masked_features, masked_indices
+
 
     # def mask_one_edge_per_graph(self, h_dense):
     #     """
     #     h_dense: [batch_size, max_num_nodes, feat_dim]
-    #     edge_batch_index: ignored here because h_dense is already batch-structured
+    #     Returns:
+    #         h_masked: tensor with masked rows replaced by self.shared_masking_token
+    #         masked_features: original features of masked rows
+    #         masked_batch_idx: tensor of batch indices of masked rows
+    #         masked_node_idx: tensor of node indices of masked rows
     #     """
-    #     batch_size, max_nodes, feat_dim = h_dense.size()
+    #     batch_size, _, _ = h_dense.size()
     #     h_masked = h_dense.clone()
-    #     masked_features = [] ; masked_indices = []
+    #     masked_batch_idx = [] ; masked_node_idx = []
 
     #     for b in range(batch_size):
-    #         # Find valid nodes (non-padded) in this batch
-    #         valid_mask = (h_dense[b].abs().sum(dim=-1) != 0)  # assuming 0 padding
+    #         # Find valid nodes (non-padded)
+    #         valid_mask = (h_dense[b].abs().sum(dim=-1) != 0)
     #         valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-
     #         if len(valid_indices) == 0:
     #             continue  # skip empty graphs
 
     #         # Pick one node/edge at random to mask
     #         node_idx = valid_indices[torch.randint(len(valid_indices), (1,))].item()
-
-    #         masked_indices.append((b, node_idx))
-    #         masked_features.append(h_dense[b, node_idx].unsqueeze(0))
+    #         masked_batch_idx.append(b) ; masked_node_idx.append(node_idx)
 
     #         # Apply shared masking token
     #         h_masked[b, node_idx] = self.shared_masking_token
 
-    #     masked_features = torch.cat(masked_features, dim=0)  # [batch_size, feat_dim] (or fewer if some graphs empty)
-    #     return h_masked, masked_features, masked_indices
+    #     masked_batch_idx = torch.tensor(masked_batch_idx, device=h_dense.device)
+    #     masked_node_idx = torch.tensor(masked_node_idx, device=h_dense.device)
 
-
-    def mask_one_edge_per_graph(self, h_dense):
-        """
-        h_dense: [batch_size, max_num_nodes, feat_dim]
-        Returns:
-            h_masked: tensor with masked rows replaced by self.shared_masking_token
-            masked_features: original features of masked rows
-            masked_batch_idx: tensor of batch indices of masked rows
-            masked_node_idx: tensor of node indices of masked rows
-        """
-        batch_size, _, _ = h_dense.size()
-        h_masked = h_dense.clone()
-        masked_batch_idx = [] ; masked_node_idx = []
-
-        for b in range(batch_size):
-            # Find valid nodes (non-padded)
-            valid_mask = (h_dense[b].abs().sum(dim=-1) != 0)
-            valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-            if len(valid_indices) == 0:
-                continue  # skip empty graphs
-
-            # Pick one node/edge at random to mask
-            node_idx = valid_indices[torch.randint(len(valid_indices), (1,))].item()
-            masked_batch_idx.append(b) ; masked_node_idx.append(node_idx)
-
-            # Apply shared masking token
-            h_masked[b, node_idx] = self.shared_masking_token
-
-        masked_batch_idx = torch.tensor(masked_batch_idx, device=h_dense.device)
-        masked_node_idx = torch.tensor(masked_node_idx, device=h_dense.device)
-
-        return h_masked, masked_batch_idx, masked_node_idx
+    #     return h_masked, masked_batch_idx, masked_node_idx
 
 
     def forward(
@@ -404,7 +358,7 @@ class Estimator(pl.LightningModule):
         num_max_items: int,
         batch,
     ):
-        
+        print("parallel hidden !")
         x = x.float()
 
         if self.lap_encoder is not None:
@@ -459,35 +413,31 @@ class Estimator(pl.LightningModule):
             h = self.node_edge_mlp(h)
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
 
-            h_clone = h.clone()
-            h = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
+            
+            # h = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
 
-            h_missing_edges = None ; latent_rep_loss = 0.0 ; connectivity_loss = 0.0
+            latent_rep_loss = 0.0
             if self.train_missing_edge:
+                print("train_missing_edge")
                 # target_connectivity = None
-                h_missing_edges, masked_graphs_idx, masked_edges_idx = self.mask_one_edge_per_graph(h_clone) # to modify because now dense_batched
-                h_missing_edges = self.st_fast(h_missing_edges, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
-
+                # h_missing_edges, masked_graphs_idx, masked_edges_idx = self.mask_one_edge_per_graph(h_clone) # to modify because now dense_batched
+                # here modify h to enclude the new masked clone
+                batch_size, max_num_nodes, feat_dim = h.size()
+                h_masked = h.clone()
+                valid_mask = (h.abs().sum(dim=-1) != 0) # Identify valid (non-zero) nodes: shape [batch_size, max_num_nodes]
+                mask_token = self.shared_masking_token.view(1, 1, -1)  # [1,1,feat_dim] # Expand shared_masking_token for broadcasting if needed
+                h_masked[valid_mask] = mask_token.expand(valid_mask.sum(), feat_dim) # Replace valid positions with masking token
+                h_and_hidden = torch.cat([h, h_masked], dim=1) # Concatenate on the first dimension
                 
-                masked_pred = h_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = h[masked_graphs_idx, masked_edges_idx]
-                latent_rep_loss = F.mse_loss(masked_pred, masked_target, reduction='sum') # Compute MSE only for masked edges
-                #latent_rep_loss = (F.mse_loss(h_missing_edges, h, reduction='none')).sum()  #.mean()
-                
-                # pred_connectivity = self.missing_edge_mlp(torch.flatten(h_missing_edges, start_dim=1))   
-                #connectivity_loss = F.mse_loss(pred_connectivity, target_connectivity, reduction='none')
-                
+                # diff 128 x n x n and 64 x 2n x 2n
+                h_and_hidden = self.st_fast_hidden(h_and_hidden, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
 
-                # print(h_missing_edges)
-                # print(h_missing_edges[masked_indices])
-                # masked the x and get the edge to predict out, for each graphs, so 64 (batch_size) edges to predict
+                h = h_and_hidden[:, :max_num_nodes, :]       # [B, N, F_out]
+                h_masked = h_and_hidden[:, max_num_nodes:, :] # [B, N, F_out]
 
-                # h_missing_edges = self.node_edge_mlp(h_missing_edges)
-                # h_missing_edges, _ = to_dense_batch(h_missing_edges, edge_batch_index, fill_value=0, max_num_nodes=num_max_items) 
+                # masked_pred = h_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = h[masked_graphs_idx, masked_edges_idx]
+                latent_rep_loss = F.mse_loss(h_masked, h, reduction='sum') # Compute MSE only for masked edges
 
-
-                # what to do : 
-                # define target connectivity properly
-                    # vectorise masked missing edges
                 
                 
         # NSA
@@ -499,7 +449,7 @@ class Estimator(pl.LightningModule):
                 h = h[dense_batch_index]
         
         predictions = self.output_mlp(torch.flatten(h, start_dim=1))
-        return predictions, latent_rep_loss, connectivity_loss
+        return predictions, latent_rep_loss
     
 
     def configure_optimizers(self):

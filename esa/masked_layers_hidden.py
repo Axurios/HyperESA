@@ -245,6 +245,21 @@ def get_adj_mask_from_edge_index_edge(
     return adj_mask
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class SABComplete(nn.Module):
     def __init__(
         self,
@@ -348,14 +363,14 @@ class SABComplete(nn.Module):
 
 
     def forward(self, inp):
-        X, edge_index, batch_mapping, max_items, adj_mask = inp
+        X, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self = inp
 
         if self.pre_or_post == "pre":
             X = self.norm(X) # also work when hyperedges in x
         if self.idx == 1:
-            out_attn = self.sab(X, adj_mask)
+            out_attn = self.sab(X, hidden_adj_masked)
         else:
-            out_attn = self.sab(X, None)
+            out_attn = self.sab(X, hidden_adj_self)
         
         if out_attn.shape[-1] != X.shape[-1]:
             X = self.proj_1(X)
@@ -382,7 +397,7 @@ class SABComplete(nn.Module):
 
         if self.residual_dropout > 0:
             out = F.dropout(out, p=self.residual_dropout)
-        return out, edge_index, batch_mapping, max_items, adj_mask
+        return out, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self
 
 
 class PMAComplete(nn.Module):
@@ -459,7 +474,7 @@ class PMAComplete(nn.Module):
 
 
     def forward(self, inp):
-        X, edge_index, batch_mapping, max_items, adj_mask = inp
+        X, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self = inp
 
         if self.pre_or_post == "pre":
             X = self.norm(X)
@@ -492,10 +507,41 @@ class PMAComplete(nn.Module):
         if self.residual_dropout > 0:
             out = F.dropout(out, p=self.residual_dropout)
 
-        return out, edge_index, batch_mapping, max_items, adj_mask
+        return out, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self
 
 
-class ESA(nn.Module):
+
+
+
+
+def add_hidden_adj_masked(adj_mask):
+    B, n, _ = adj_mask.shape ; device = adj_mask.device
+    adj_and_hidden = torch.zeros((B, 2*n, 2*n), dtype=torch.bool, device=device) # Create an empty 2n x 2n zero tensor
+    adj_and_hidden[:, :n, :n] = adj_mask  # Place original adj in upper-left
+    adj_and_hidden[:, n:, :n] = (adj_mask.clone()).fill_diagonal_(0) # Place original adj, ensure not allowed to see their correspondent in lower-left
+    # new_adj = | adj      0 |
+    #           | adj      0 |
+    return adj_and_hidden
+
+
+def add_hidden_adj_self(adj_mask):
+    B, n, _ = adj_mask.shape ; device = adj_mask.device
+    adj_and_hidden = torch.zeros((B, 2*n, 2*n), dtype=torch.bool, device=device) # Create empty 2n x 2n adjacency
+
+    adj_and_hidden[:, :n, :n] = 1 # Upper-left block: fully connected except diagonal
+    adj_and_hidden[:, :n, :n].fill_diagonal_(0)  # diagonal is zero
+
+    adj_and_hidden[:, n:, :n] = 1
+    adj_and_hidden[:, n:, :n].fill_diagonal_(0)
+    # new_adj = | 1 (no diag)   0 | for self-attention.
+    #           | 1 (no diag)   0 |
+    
+    return adj_and_hidden
+
+
+
+
+class ESA_hidden(nn.Module):
     def __init__(
         self,
         num_outputs,
@@ -521,7 +567,7 @@ class ESA(nn.Module):
         set_max_items=0,
         use_bfloat16=True,
     ):
-        super(ESA, self).__init__()
+        super(ESA_hidden, self).__init__()
 
         assert len(layer_types) == len(dim_hidden) and len(layer_types) == len(num_heads)
 
@@ -690,17 +736,17 @@ class ESA(nn.Module):
 
 
     def forward(self, X, edge_index, batch_mapping, num_max_items, is_using_hyperedges=False, hyperedge_index=None, hedge_batch_index=None,):
+        x_size, max_num_edges, feat_dim = X.size()
+        max_num_edges = max_num_edges // 2
+        # X_and_hidden = X.clone()
 
-        if self.node_or_edge == "node":
-            adj_mask = get_adj_mask_from_edge_index_node(
-                edge_index=edge_index,
-                batch_mapping=batch_mapping,
-                batch_size=X.shape[0],
-                max_items=self.set_max_items,
-                xformers_or_torch_attn=self.xformers_or_torch_attn,
-                use_bfloat16=self.use_bfloat16,
-            )
-        elif self.node_or_edge == "edge":
+        # h = X[:, :max_num_edges, :]       # [B, N, F_out]
+        # h_masked = X[:, max_num_edges:, :] # [B, N, F_out]
+
+
+
+        # modify this to be the perfect adj_mask
+        if self.node_or_edge == "edge":
             adj_mask = get_adj_mask_from_edge_index_edge(
                 edge_index=edge_index,
                 batch_mapping=batch_mapping,
@@ -712,12 +758,25 @@ class ESA(nn.Module):
                 hyperedge_index=hyperedge_index,
                 hedge_batch_index=hedge_batch_index,
             )
+
+            hidden_adj_masked = add_hidden_adj_masked(adj_mask)
+            hidden_adj_self = add_hidden_adj_self(hidden_adj_masked)
+
+        # elif self.node_or_edge == "node":
+        #     adj_mask = get_adj_mask_from_edge_index_node(
+        #         edge_index=edge_index,
+        #         batch_mapping=batch_mapping,
+        #         batch_size=X.shape[0],
+        #         max_items=self.set_max_items,
+        #         xformers_or_torch_attn=self.xformers_or_torch_attn,
+        #         use_bfloat16=self.use_bfloat16,
+        #     )
         
         # issue is when is_using_hyperedges, adj_mask contains the hyperedges connectivity, but the edge_index and the batch_mapping don't
         # batch_mapping links node with graphs, so not an issue
         # the true issue is edge_index which is only edges, not hyperedges
 
-        enc, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask))
+        enc, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask, hidden_adj_masked, hidden_adj_self))
         if hasattr(self, "dim_pma") and self.dim_hidden[0] != self.dim_pma:
             X = self.out_proj(X)
 

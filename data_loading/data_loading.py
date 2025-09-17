@@ -439,7 +439,7 @@ def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
     print("Loading QM9 dataset...")
     add_hyper_edges = kwargs.get("add_hyper_edges", False)
 
-    print("target names :", target_name)
+    # print("target names :", target_name)
     if target_name == ["all"]:
         target_name = QM9_TARGETS
         print("Using all targets")
@@ -506,8 +506,8 @@ def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
                 max_hyper_data = data ; max_idx = idx
 
         print(f"Max hyperedges found: {max_hyperedges}") ; print(max_hyper_data.hyperedges)
-        normal_graph_data = train[max_idx]
-        draw_pyg_as_xgi(normal_graph_data) ; draw_pyg_as_xgi(max_hyper_data)
+        # normal_graph_data = train[max_idx]
+        # draw_pyg_as_xgi(normal_graph_data) ; draw_pyg_as_xgi(max_hyper_data)
 
         train = train_hyper ; val = val_hyper ; test = test_hyper
     # ----------------------

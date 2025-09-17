@@ -24,6 +24,7 @@ class SmallMLP(nn.Module):
         super().__init__()
 
         self.mlp = []
+        self.in_dim = in_dim
 
         if num_layers == 1:
             self.mlp = nn.Sequential(
