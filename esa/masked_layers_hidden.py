@@ -203,8 +203,6 @@ def get_adj_mask_from_edge_index_edge(
         mask_dtype = torch.bfloat16 if use_bfloat16 else torch.float32
         edge_mask_fill_value = 0
     
-    # print(max_items, "max items")
-    # print(edge_index.shape[1], "edge index shape")
     adj_mask = torch.full(
         size=(batch_size, max_items, max_items),
         fill_value=empty_mask_fill_value,
@@ -313,7 +311,7 @@ class SABComplete(nn.Module):
             bn_dim = self.set_max_items
         else:
             bn_dim = 32
-
+ 
         if norm_type == "LN":
             if self.pre_or_post == "post":
                 if self.idx != 2:
@@ -364,39 +362,74 @@ class SABComplete(nn.Module):
 
     def forward(self, inp):
         X, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self = inp
-
         if self.pre_or_post == "pre":
             X = self.norm(X) # also work when hyperedges in x
         if self.idx == 1:
-            out_attn = self.sab(X, hidden_adj_masked)
+            if hidden_adj_masked is not None:
+                out_attn = self.sab(X, hidden_adj_masked)
+            else :
+                out_attn = self.sab(X, adj_mask)
         else:
-            out_attn = self.sab(X, hidden_adj_self)
-        
+            if hidden_adj_self is not None :
+                out_attn = self.sab(X, hidden_adj_self)
+            else:
+                out_attn = self.sab(X)
+
         if out_attn.shape[-1] != X.shape[-1]:
             X = self.proj_1(X)
-        
+
         if self.pre_or_post == "pre":
             out = X + out_attn
-        
+
         if self.pre_or_post == "post":
             out = self.residual_attn(X, out_attn)
-            out = self.norm(out)
-        
+
+            b, max_num , f = X.shape
+            # Split the tensor into two parts
+            if hidden_adj_masked is not None:
+                max_num_divided = max_num//2
+                out1 = out[:, :max_num_divided, :]  # First b * 64 * f part
+                out2 = out[:, max_num_divided:, :]  # Second b * 64 * f part
+
+                out1 = self.norm(out1)
+                out2 = self.norm(out2)
+                # out = self.norm(out) # this is the issue line
+                out = torch.cat((out1,out2), dim=1)
+            else:
+                out = self.norm(out)
+
         if self.use_mlp:
             if self.pre_or_post == "pre":
                 out_mlp = self.norm_mlp(out)
                 out_mlp = self.mlp(out_mlp)
+
                 if out.shape[-1] == out_mlp.shape[-1]:
                     out = out_mlp + out
+
 
             if self.pre_or_post == "post":
                 out_mlp = self.mlp(out)
                 if out.shape[-1] == out_mlp.shape[-1]:
                     out = self.residual_mlp(out, out_mlp)
-                out = self.norm_mlp(out)
+
+                b, max_num , f = out.shape
+                # Split the tensor into two parts
+                if hidden_adj_masked is not None:
+                    max_num_divided = max_num//2
+                    out1 = out[:, :max_num_divided, :]  # First b * 64 * f part
+                    out2 = out[:, max_num_divided:, :]  # Second b * 64 * f part
+
+                    out1 = self.norm_mlp(out1)
+                    out2 = self.norm_mlp(out2)
+
+                    # out = self.norm_mlp(out)
+                    out = torch.cat((out1,out2), dim=1)
+                else:
+                    out = self.norm_mlp(out)
 
         if self.residual_dropout > 0:
             out = F.dropout(out, p=self.residual_dropout)
+
         return out, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self
 
 
@@ -511,31 +544,48 @@ class PMAComplete(nn.Module):
 
 
 
+def zero_diag_batch(tensor):
+    # tensor: [B, n, n]
+    B, n, _ = tensor.shape
+    idx = torch.arange(n, device=tensor.device)
+    tensor[:, idx, idx] = 0
+    return tensor
 
 
+def add_hidden_adj_masked(adj_mask_given):
+    adj_mask = adj_mask_given.clone()
+    B, _, n, _ = adj_mask.shape
+    device = adj_mask.device
+    adj_and_hidden = torch.zeros((B, 1, 2*n, 2*n), dtype=torch.float32, device=device)
 
-def add_hidden_adj_masked(adj_mask):
-    B, n, _ = adj_mask.shape ; device = adj_mask.device
-    adj_and_hidden = torch.zeros((B, 2*n, 2*n), dtype=torch.bool, device=device) # Create an empty 2n x 2n zero tensor
-    adj_and_hidden[:, :n, :n] = adj_mask  # Place original adj in upper-left
-    adj_and_hidden[:, n:, :n] = (adj_mask.clone()).fill_diagonal_(0) # Place original adj, ensure not allowed to see their correspondent in lower-left
-    # new_adj = | adj      0 |
-    #           | adj      0 |
+    # Upper-left block
+    upper_left = adj_mask[:, 0].clone()  # [B, n, n]
+    upper_left = zero_diag_batch(upper_left)
+    adj_and_hidden[:, 0, :n, :n] = upper_left
+
+    # Lower-left block
+    lower_left = adj_mask[:, 0].clone()  # [B, n, n]
+    lower_left = zero_diag_batch(lower_left)
+    adj_and_hidden[:, 0, n:, :n] = lower_left
+
     return adj_and_hidden
 
 
-def add_hidden_adj_self(adj_mask):
-    B, n, _ = adj_mask.shape ; device = adj_mask.device
-    adj_and_hidden = torch.zeros((B, 2*n, 2*n), dtype=torch.bool, device=device) # Create empty 2n x 2n adjacency
+#     return adj_and_hidden
+def add_hidden_adj_self(adj_mask_given):
+    adj_mask = adj_mask_given.clone()
+    B, _, n, _ = adj_mask.shape ; device = adj_mask.device
+    adj_and_hidden = torch.zeros((B, 1, 2*n, 2*n), dtype=torch.float32, device=device)
 
-    adj_and_hidden[:, :n, :n] = 1 # Upper-left block: fully connected except diagonal
-    adj_and_hidden[:, :n, :n].fill_diagonal_(0)  # diagonal is zero
-
-    adj_and_hidden[:, n:, :n] = 1
-    adj_and_hidden[:, n:, :n].fill_diagonal_(0)
-    # new_adj = | 1 (no diag)   0 | for self-attention.
-    #           | 1 (no diag)   0 |
+    def ones_no_diag(B, n, device):# Helper to zero diagonal per batch
+        mat = torch.ones((B, n, n), dtype=torch.float32, device=device)
+        idx = torch.arange(n, device=device)
+        mat[:, idx, idx] = 0
+        return mat
     
+    adj_and_hidden[:, 0, :n, :n] = ones_no_diag(B, n, device)# Upper-left block
+    adj_and_hidden[:, 0, n:, :n] = ones_no_diag(B, n, device) # Lower-left block
+
     return adj_and_hidden
 
 
@@ -737,7 +787,7 @@ class ESA_hidden(nn.Module):
 
     def forward(self, X, edge_index, batch_mapping, num_max_items, is_using_hyperedges=False, hyperedge_index=None, hedge_batch_index=None,):
         x_size, max_num_edges, feat_dim = X.size()
-        max_num_edges = max_num_edges // 2
+        # max_num_edges = max_num_edges // 2
         # X_and_hidden = X.clone()
 
         # h = X[:, :max_num_edges, :]       # [B, N, F_out]
@@ -760,7 +810,7 @@ class ESA_hidden(nn.Module):
             )
 
             hidden_adj_masked = add_hidden_adj_masked(adj_mask)
-            hidden_adj_self = add_hidden_adj_self(hidden_adj_masked)
+            hidden_adj_self = add_hidden_adj_self(adj_mask)
 
         # elif self.node_or_edge == "node":
         #     adj_mask = get_adj_mask_from_edge_index_node(
@@ -774,18 +824,64 @@ class ESA_hidden(nn.Module):
         
         # issue is when is_using_hyperedges, adj_mask contains the hyperedges connectivity, but the edge_index and the batch_mapping don't
         # batch_mapping links node with graphs, so not an issue
-        # the true issue is edge_index which is only edges, not hyperedges
+        # # the true issue is edge_index which is only edges, not hyperedges
 
-        enc, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask, hidden_adj_masked, hidden_adj_self))
+        enc, _, _, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask, hidden_adj_masked, hidden_adj_self))
+
         if hasattr(self, "dim_pma") and self.dim_hidden[0] != self.dim_pma:
             X = self.out_proj(X)
-
         enc = enc + X
 
+        B_enc, max_num_enc, F_enc = enc.shape
+        max_num_enc_div = max_num_enc//2
+        enc_normal = enc[:, :max_num_enc_div, :]   # [:, :max_num_nodes, :] 
+        enc_hidden = enc[:, max_num_enc_div:, :]   # [:, :max_num_nodes, :]
+
+        latent_rep_loss = F.mse_loss(enc_hidden, enc_normal, reduction='sum')   # here we compare enc_normal and enc_hidden
+
         if hasattr(self, "decoder"):
-            out, _, _, _, _ = self.decoder((enc, edge_index, batch_mapping, num_max_items, adj_mask))
+            # out, _, _, _, _, _, _ = self.decoder((enc, edge_index, batch_mapping, num_max_items, adj_mask, hidden_adj_masked, hidden_adj_self))
+            out, _, _, _, _, _, _ = self.decoder((enc_normal, edge_index, batch_mapping, num_max_items, adj_mask, None, None))
             out = out.mean(dim=1)
         else:
-            out = enc
+            out = enc_normal
 
-        return F.mish(self.decoder_linear(out))
+        return F.mish(self.decoder_linear(out)), latent_rep_loss
+
+
+
+
+
+
+# def add_hidden_adj_masked(adj_mask):
+#     print("until here all good")
+#     print(adj_mask.shape)
+#     B, useless, n, _ = adj_mask.shape ; device = adj_mask.device
+#     adj_and_hidden = torch.zeros((B, 1, 2*n, 2*n), dtype=torch.bool, device=device) # Create an empty 2n x 2n zero tensor
+#     adj_and_hidden[:, :, :n, :n] = adj_mask  # Place original adj in upper-left
+#     adj_and_hidden[:, :, n:, :n] = (((adj_mask.squeeze(1)).clone()).fill_diagonal_(0)).unsqueeze(1) # Place original adj, ensure not allowed to see their correspondent in lower-left
+#     # new_adj = | adj      0 |
+#     #           | adj      0 |
+#     return adj_and_hidden
+
+
+
+# def add_hidden_adj_self(adj_mask):
+#     B, useless, n, _ = adj_mask.shape ; device = adj_mask.device
+#     adj_and_hidden = torch.zeros((B, 1, 2*n, 2*n), dtype=torch.bool, device=device) # Create empty 2n x 2n adjacency
+
+#     # adj_and_hidden[:, :, :n, :n] = 1 # Upper-left block: fully connected except diagonal
+#     # adj_and_hidden[:, :, :n, :n].fill_diagonal_(0)  # diagonal is zero
+#     upper_left = torch.ones((B, n, n), dtype=torch.bool, device=device).fill_diagonal_(0)
+#     adj_and_hidden[:, 0, :n, :n] = upper_left
+
+#     # adj_and_hidden[:, :, n:, :n] = 1
+#     # adj_and_hidden[:, :, n:, :n].fill_diagonal_(0)
+#     lower_left = torch.ones((B, n, n), dtype=torch.bool, device=device).fill_diagonal_(0)
+#     adj_and_hidden[:, 0, n:, :n] = lower_left
+#     # new_adj = | 1 (no diag)   0 | for self-attention.
+#     #           | 1 (no diag)   0 |
+    
+
+
+     

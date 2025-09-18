@@ -66,9 +66,13 @@ class MAB(nn.Module):
         if adj_mask is not None:
             adj_mask = adj_mask.expand(-1, self.num_heads, -1, -1)
 
+        # print("just before m eff attn")
         if self.xformers_or_torch_attn == "xformers":
+            # print("xformers attn")
             out = memory_efficient_attention(Q, K, V, attn_bias=adj_mask, p=self.dropout_p if self.training else 0)
+            # print("attn ok")
             out = out.reshape(batch_size, -1, self.num_heads * head_dim)
+            # print("reshape ok")
             
         elif self.xformers_or_torch_attn in ["torch"]:
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):

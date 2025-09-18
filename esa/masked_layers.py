@@ -722,6 +722,8 @@ class ESA(nn.Module):
             X = self.out_proj(X)
 
         enc = enc + X
+        
+        # latent_rep_loss = 0.0 
 
         if hasattr(self, "decoder"):
             out, _, _, _, _ = self.decoder((enc, edge_index, batch_mapping, num_max_items, adj_mask))
@@ -729,4 +731,4 @@ class ESA(nn.Module):
         else:
             out = enc
 
-        return F.mish(self.decoder_linear(out))
+        return F.mish(self.decoder_linear(out)), enc

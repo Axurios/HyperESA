@@ -90,6 +90,7 @@ class Estimator(pl.LightningModule):
         self.task_type = task_type
 
         # print(task_type) # prints regression ok
+        print("Classic esa")
 
         self.edge_dim = edge_dim
 
@@ -460,17 +461,22 @@ class Estimator(pl.LightningModule):
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
 
             h_clone = h.clone()
-            h = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
+            # print("h shape before", h.shape)
+            h, enc = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
+            # print("h shape AFTER", h.shape)
 
             h_missing_edges = None ; latent_rep_loss = 0.0 ; connectivity_loss = 0.0
             if self.train_missing_edge:
                 # target_connectivity = None
                 h_missing_edges, masked_graphs_idx, masked_edges_idx = self.mask_one_edge_per_graph(h_clone) # to modify because now dense_batched
-                h_missing_edges = self.st_fast(h_missing_edges, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
+                h_missing_edges, enc_missing_edges = self.st_fast(h_missing_edges, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
 
                 
-                masked_pred = h_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = h[masked_graphs_idx, masked_edges_idx]
-                latent_rep_loss = F.mse_loss(masked_pred, masked_target, reduction='sum') # Compute MSE only for masked edges
+                # this is wrong implementation
+                masked_pred = enc_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = enc[masked_graphs_idx, masked_edges_idx]
+                # latent_rep_loss = F.mse_loss(enc_missing_edges, enc, reduction='sum') # Compute MSE for all the edges
+                latent_rep_loss = F.mse_loss(masked_pred, masked_target, reduction='mean') # Compute MSE only for the masked edges
+                # latent_rep_loss = 0.0
                 #latent_rep_loss = (F.mse_loss(h_missing_edges, h, reduction='none')).sum()  #.mean()
                 
                 # pred_connectivity = self.missing_edge_mlp(torch.flatten(h_missing_edges, start_dim=1))   

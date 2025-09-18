@@ -319,7 +319,7 @@ def main():
     if dataset != "ocp":
         model_args |= dict(is_node_task=check_is_node_level_dataset(dataset))
    
-    train_hidden = argsdict["train_missing"] 
+    train_hidden = argsdict["train_hidden"] 
     if train_hidden:
         print("using hidden estimator")
         model = hEstimator(**model_args) if dataset != "ocp" else Estimator_OCP(**model_args)

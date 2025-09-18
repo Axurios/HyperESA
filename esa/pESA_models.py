@@ -358,7 +358,7 @@ class hEstimator(pl.LightningModule):
         num_max_items: int,
         batch,
     ):
-        print("parallel hidden !")
+        # print("parallel hidden !")
         x = x.float()
 
         if self.lap_encoder is not None:
@@ -418,25 +418,35 @@ class hEstimator(pl.LightningModule):
 
             latent_rep_loss = 0.0
             if self.train_missing_edge:
-                print("train_missing_edge")
+                # print("train_missing_edge")
                 # target_connectivity = None
                 # h_missing_edges, masked_graphs_idx, masked_edges_idx = self.mask_one_edge_per_graph(h_clone) # to modify because now dense_batched
                 # here modify h to enclude the new masked clone
                 batch_size, max_num_nodes, feat_dim = h.size()
                 h_masked = h.clone()
                 valid_mask = (h.abs().sum(dim=-1) != 0) # Identify valid (non-zero) nodes: shape [batch_size, max_num_nodes]
-                mask_token = self.shared_masking_token.view(1, 1, -1)  # [1,1,feat_dim] # Expand shared_masking_token for broadcasting if needed
+                mask_token = self.shared_masking_token.view(1, -1)  # [1,1,feat_dim] # Expand shared_masking_token for broadcasting if needed
                 h_masked[valid_mask] = mask_token.expand(valid_mask.sum(), feat_dim) # Replace valid positions with masking token
                 h_and_hidden = torch.cat([h, h_masked], dim=1) # Concatenate on the first dimension
                 
-                # diff 128 x n x n and 64 x 2n x 2n
-                h_and_hidden = self.st_fast_hidden(h_and_hidden, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
+                # diff 128 x n x features and 64 x 2n x features
+                # print("shape of h_and_hidden", h_and_hidden.shape)
+                h_and_hidden, latent_rep_loss = self.st_fast_hidden(h_and_hidden, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
+                # print("after st fast")
+                
+                # already graph based representation B, G_out not B, E, F_out
+                # print(h_and_hidden.shape)
+                # h = h_and_hidden[:, :max_num_nodes, :]        # [B, N, F_out]
+                # h_masked = h_and_hidden[:, max_num_nodes:, :] # [B, N, F_out]
+                h = h_and_hidden
+                latent_rep_loss = 0.0
+                
+                # need to decode with only the upper part for the predictions
+                # need to compare the upper enc part with below part enc.
 
-                h = h_and_hidden[:, :max_num_nodes, :]       # [B, N, F_out]
-                h_masked = h_and_hidden[:, max_num_nodes:, :] # [B, N, F_out]
 
-                # masked_pred = h_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = h[masked_graphs_idx, masked_edges_idx]
-                latent_rep_loss = F.mse_loss(h_masked, h, reduction='sum') # Compute MSE only for masked edges
+                # # masked_pred = h_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = h[masked_graphs_idx, masked_edges_idx]
+                # latent_rep_loss = F.mse_loss(h_masked, h, reduction='sum') # Compute MSE only for masked edges # should be mean 
 
                 
                 
@@ -449,6 +459,7 @@ class hEstimator(pl.LightningModule):
                 h = h[dense_batch_index]
         
         predictions = self.output_mlp(torch.flatten(h, start_dim=1))
+        # print("predictions done")
         return predictions, latent_rep_loss
     
 
@@ -485,7 +496,7 @@ class hEstimator(pl.LightningModule):
         batch = None,
     ):
   
-        predictions, latent_rep_loss, connectivity_loss = self.forward(x, edge_index, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, batch=batch)  
+        predictions, latent_rep_loss = self.forward(x, edge_index, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, batch=batch)  
 
         if self.task_type == "multi_classification":
             predictions = predictions.reshape(-1, self.linear_output_size)
@@ -627,24 +638,18 @@ class hEstimator(pl.LightningModule):
     def validation_step(self, batch: torch.Tensor, batch_idx: int, dataloader_idx: int = 0):
         if dataloader_idx == 0:
             val_total_loss, latent_rep_loss = self._step(batch, "validation")
-
             self.log("val_loss", val_total_loss)
-
             return val_total_loss
 
         if dataloader_idx == 1:
             val_test_total_loss, latent_rep_loss = self._step(batch, "validation_test")
-
             self.log("val_test_loss", val_test_total_loss)
-
             return val_test_total_loss
 
 
     def test_step(self, batch: torch.Tensor, batch_idx: int):
         test_total_loss, latent_rep_loss = self._step(batch, "test")
-
         self.log("test_loss", test_total_loss)
-
         return test_total_loss
 
 
