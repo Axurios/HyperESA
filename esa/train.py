@@ -191,7 +191,8 @@ def main():
 
     ############## Data loading ##############
     train_mask, val_mask, test_mask = None, None, None
-    
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    print(f"Total GPU memory: {total:.2f} GB")
 
     if dataset != "ocp":
         if check_is_node_level_dataset(dataset):

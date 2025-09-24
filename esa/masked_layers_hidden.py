@@ -124,18 +124,10 @@ def get_first_unique_index(t):
 
 
 def generate_consecutive_tensor(input_tensor, final):
-    # Calculate the length of each segment
-    lengths = input_tensor[1:] - input_tensor[:-1]
-
-    # Append the final length
-    lengths = torch.cat((lengths, torch.tensor([final - input_tensor[-1]], device=torch.device("cuda:0"))))
-
-    # Create ranges for each segment
-    ranges = [torch.arange(0, length, device=torch.device("cuda:0")) for length in lengths]
-
-    # Concatenate all ranges into a single tensor
-    result = torch.cat(ranges)
-
+    lengths = input_tensor[1:] - input_tensor[:-1]  # Calculate the length of each segment
+    lengths = torch.cat((lengths, torch.tensor([final - input_tensor[-1]], device=torch.device("cuda:0"))))  # Append the final length
+    ranges = [torch.arange(0, length, device=torch.device("cuda:0")) for length in lengths]  # Create ranges for each segment
+    result = torch.cat(ranges) # Concatenate all ranges into a single tensor
     return result
 
 # This is needed if the standard "nonzero" method from PyTorch fails
@@ -146,14 +138,11 @@ def nonzero_chunked(ten, num_chunks):
     # https://github.com/facebookresearch/segment-anything/pull/569/files
     b, w_h = ten.shape
     total_elements = b * w_h
-
     # Maximum allowable elements in one chunk - as torch is using 32 bit integers for this function
     max_elements_per_chunk = 2**31 - 1
-
     # Calculate the number of chunks needed
     if total_elements % max_elements_per_chunk != 0:
         num_chunks += 1
-
     # Calculate the actual chunk size
     chunk_size = b // num_chunks
     if b % num_chunks != 0:
@@ -161,19 +150,15 @@ def nonzero_chunked(ten, num_chunks):
 
     # List to store the results from each chunk
     all_indices = []
-
     # Loop through the diff tensor in chunks
     for i in range(num_chunks):
         start = i * chunk_size
         end = min((i + 1) * chunk_size, b)
         chunk = ten[start:end, :]
-
         # Get non-zero indices for the current chunk
         indices = chunk.nonzero()
-
         # Adjust the row indices to the original tensor
         indices[:, 0] += start
-
         all_indices.append(indices)
 
     # Concatenate all the results
@@ -245,10 +230,21 @@ def get_adj_mask_from_edge_index_edge(
 
 
 
+def batched_effective_rank(X: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    # Compute singular values: shape (B, min(N, D))
+    S = torch.linalg.svdvals(X)
+    # Normalize singular values to get probability vectors
+    S_sum = S.sum(dim=1, keepdim=True)  # shape (B, 1)
+    mask = S_sum > eps  # to handle all-zero matrices
+    p = S / (S_sum + eps)  # shape (B, r)
+    # Compute entropy per batch
+    entropy = -torch.sum(p * torch.log(p + eps), dim=1)  # shape (B,)
+    # Effective rank = exp(entropy)
+    eff_rank = torch.exp(entropy)
+    # Zero out effective rank where total singular value was too small
+    eff_rank = eff_rank * mask.squeeze(1)
 
-
-
-
+    return eff_rank
 
 
 
@@ -433,6 +429,14 @@ class SABComplete(nn.Module):
         return out, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self
 
 
+
+
+
+
+
+
+
+
 class PMAComplete(nn.Module):
     def __init__(
         self,
@@ -544,49 +548,87 @@ class PMAComplete(nn.Module):
 
 
 
-def zero_diag_batch(tensor):
+def zero_diag_batch(tensor, empty_mask_fill_value):
     # tensor: [B, n, n]
     B, n, _ = tensor.shape
     idx = torch.arange(n, device=tensor.device)
-    tensor[:, idx, idx] = 0
+    tensor[:, idx, idx] = empty_mask_fill_value
     return tensor
 
 
-def add_hidden_adj_masked(adj_mask_given):
+
+
+
+def add_hidden_adj_masked(adj_mask_given, xformers_or_torch_attn, use_bfloat16, zero_mask):
+    if xformers_or_torch_attn in ["torch"]:
+        empty_mask_fill_value = False
+        mask_dtype = torch.bool 
+        edge_mask_fill_value = True
+    else:
+        empty_mask_fill_value = -99999
+        mask_dtype = torch.bfloat16 if use_bfloat16 else torch.float32
+        edge_mask_fill_value = 0
     adj_mask = adj_mask_given.clone()
     B, _, n, _ = adj_mask.shape
     device = adj_mask.device
-    adj_and_hidden = torch.zeros((B, 1, 2*n, 2*n), dtype=torch.float32, device=device)
+    # adj_and_hidden = torch.zeros((B, 1, 2*n, 2*n), dtype=torch.float32, device=device)
+    adj_and_hidden = torch.full((B, 1, 2*n, 2*n), fill_value=empty_mask_fill_value, dtype=torch.float32, device=device)
 
     # Upper-left block
-    upper_left = adj_mask[:, 0].clone()  # [B, n, n]
-    upper_left = zero_diag_batch(upper_left)
+    upper_left = adj_mask[:, 0, :, :].clone()  # [B, n, n]
+    upper_left = zero_diag_batch(upper_left, empty_mask_fill_value)
     adj_and_hidden[:, 0, :n, :n] = upper_left
 
     # Lower-left block
-    lower_left = adj_mask[:, 0].clone()  # [B, n, n]
-    lower_left = zero_diag_batch(lower_left)
+    lower_left = adj_mask[:, 0, :, :].clone()  # [B, n, n]
+    lower_left = zero_diag_batch(lower_left, empty_mask_fill_value)
     adj_and_hidden[:, 0, n:, :n] = lower_left
 
+    adj_and_hidden[zero_mask.unsqueeze(1)] = empty_mask_fill_value
+
     return adj_and_hidden
 
 
-#     return adj_and_hidden
-def add_hidden_adj_self(adj_mask_given):
+
+def add_hidden_adj_self(adj_mask_given, xformers_or_torch_attn, use_bfloat16, zero_mask):
+    if xformers_or_torch_attn in ["torch"]:
+        empty_mask_fill_value = False
+        mask_dtype = torch.bool 
+        edge_mask_fill_value = True
+    else:
+        empty_mask_fill_value = -99999
+        mask_dtype = torch.bfloat16 if use_bfloat16 else torch.float32
+        edge_mask_fill_value = 0
+
     adj_mask = adj_mask_given.clone()
     B, _, n, _ = adj_mask.shape ; device = adj_mask.device
-    adj_and_hidden = torch.zeros((B, 1, 2*n, 2*n), dtype=torch.float32, device=device)
+    # adj_and_hidden = torch.zeros((B, 1, 2*n, 2*n), dtype=torch.float32, device=device)
+    adj_and_hidden = torch.full((B, 1, 2*n, 2*n), fill_value=empty_mask_fill_value, dtype=torch.float32, device=device)
 
     def ones_no_diag(B, n, device):# Helper to zero diagonal per batch
-        mat = torch.ones((B, n, n), dtype=torch.float32, device=device)
+        mat = torch.full((B, n, n), fill_value=edge_mask_fill_value, dtype=torch.float32, device=device) # careful can still attend to padded rows...
         idx = torch.arange(n, device=device)
-        mat[:, idx, idx] = 0
+        mat[:, idx, idx] = empty_mask_fill_value
         return mat
     
-    adj_and_hidden[:, 0, :n, :n] = ones_no_diag(B, n, device)# Upper-left block
+    adj_and_hidden[:, 0, :n, :n] = ones_no_diag(B, n, device) # Upper-left block
     adj_and_hidden[:, 0, n:, :n] = ones_no_diag(B, n, device) # Lower-left block
 
+    adj_and_hidden[zero_mask.unsqueeze(1)] = empty_mask_fill_value
+
     return adj_and_hidden
+# issue when using torch likely
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -785,15 +827,7 @@ class ESA_hidden(nn.Module):
             self.dim_pma = dim_pma
 
 
-    def forward(self, X, edge_index, batch_mapping, num_max_items, is_using_hyperedges=False, hyperedge_index=None, hedge_batch_index=None,):
-        x_size, max_num_edges, feat_dim = X.size()
-        # max_num_edges = max_num_edges // 2
-        # X_and_hidden = X.clone()
-
-        # h = X[:, :max_num_edges, :]       # [B, N, F_out]
-        # h_masked = X[:, max_num_edges:, :] # [B, N, F_out]
-
-
+    def forward(self, X, edge_index, batch_mapping, num_max_items, is_using_hyperedges=False, hyperedge_index=None, hedge_batch_index=None, zero_mask=None):
 
         # modify this to be the perfect adj_mask
         if self.node_or_edge == "edge":
@@ -809,8 +843,8 @@ class ESA_hidden(nn.Module):
                 hedge_batch_index=hedge_batch_index,
             )
 
-            hidden_adj_masked = add_hidden_adj_masked(adj_mask)
-            hidden_adj_self = add_hidden_adj_self(adj_mask)
+            hidden_adj_masked = add_hidden_adj_masked(adj_mask, xformers_or_torch_attn=self.xformers_or_torch_attn, use_bfloat16=self.use_bfloat16, zero_mask = zero_mask)
+            hidden_adj_self = add_hidden_adj_self(adj_mask, xformers_or_torch_attn=self.xformers_or_torch_attn, use_bfloat16=self.use_bfloat16, zero_mask = zero_mask)
 
         # elif self.node_or_edge == "node":
         #     adj_mask = get_adj_mask_from_edge_index_node(
@@ -824,20 +858,31 @@ class ESA_hidden(nn.Module):
         
         # issue is when is_using_hyperedges, adj_mask contains the hyperedges connectivity, but the edge_index and the batch_mapping don't
         # batch_mapping links node with graphs, so not an issue
-        # # the true issue is edge_index which is only edges, not hyperedges
-
+        # # # the true issue is edge_index which is only edges, not hyperedges
+ 
         enc, _, _, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask, hidden_adj_masked, hidden_adj_self))
 
         if hasattr(self, "dim_pma") and self.dim_hidden[0] != self.dim_pma:
             X = self.out_proj(X)
         enc = enc + X
+        enc[zero_mask] = 0
 
-        B_enc, max_num_enc, F_enc = enc.shape
-        max_num_enc_div = max_num_enc//2
-        enc_normal = enc[:, :max_num_enc_div, :]   # [:, :max_num_nodes, :] 
-        enc_hidden = enc[:, max_num_enc_div:, :]   # [:, :max_num_nodes, :]
+        # print(enc.shape)
+        
+        _, max_num_enc, _ = enc.shape ; max_num_enc_div = max_num_enc//2
+        enc_normal = enc[:, :max_num_enc_div, :] ; enc_hidden = enc[:, max_num_enc_div:, :]  
 
-        latent_rep_loss = F.mse_loss(enc_hidden, enc_normal, reduction='sum')   # here we compare enc_normal and enc_hidden
+        # ranks = torch.linalg.matrix_rank(enc_normal)
+        normal_ranks = batched_effective_rank(enc_normal) ; hidden_ranks = batched_effective_rank(enc_hidden)
+        mean_rank = normal_ranks.float().mean().detach() ; mean_hidden_rank = hidden_ranks.mean().detach()
+
+        
+        mean_enc = enc.mean(dim=1, keepdim=True) ; dist_l2 = ((enc - mean_enc) ** 2).sum(dim=2).sqrt() ; l2_loss = dist_l2.mean().detach()
+        mean_enc_normal = enc_normal.mean(dim=1, keepdim=True) ; dist_l2_normal = ((enc_normal - mean_enc_normal) ** 2).sum(dim=2).sqrt() ; l2_loss_normal = dist_l2_normal.mean().detach()
+        mean_enc_hidden = enc_hidden.mean(dim=1, keepdim=True) ; dist_l2_hidden = ((enc_hidden - mean_enc_hidden) ** 2).sum(dim=2).sqrt() ; l2_loss_hidden = dist_l2_hidden.mean().detach()
+
+        enc_target = (enc_normal.detach()).clone()
+        latent_rep_loss = F.mse_loss(enc_hidden, enc_target, reduction='mean')   # here we compare enc_normal and enc_hidden
 
         if hasattr(self, "decoder"):
             # out, _, _, _, _, _, _ = self.decoder((enc, edge_index, batch_mapping, num_max_items, adj_mask, hidden_adj_masked, hidden_adj_self))
@@ -846,42 +891,5 @@ class ESA_hidden(nn.Module):
         else:
             out = enc_normal
 
-        return F.mish(self.decoder_linear(out)), latent_rep_loss
-
-
-
-
-
-
-# def add_hidden_adj_masked(adj_mask):
-#     print("until here all good")
-#     print(adj_mask.shape)
-#     B, useless, n, _ = adj_mask.shape ; device = adj_mask.device
-#     adj_and_hidden = torch.zeros((B, 1, 2*n, 2*n), dtype=torch.bool, device=device) # Create an empty 2n x 2n zero tensor
-#     adj_and_hidden[:, :, :n, :n] = adj_mask  # Place original adj in upper-left
-#     adj_and_hidden[:, :, n:, :n] = (((adj_mask.squeeze(1)).clone()).fill_diagonal_(0)).unsqueeze(1) # Place original adj, ensure not allowed to see their correspondent in lower-left
-#     # new_adj = | adj      0 |
-#     #           | adj      0 |
-#     return adj_and_hidden
-
-
-
-# def add_hidden_adj_self(adj_mask):
-#     B, useless, n, _ = adj_mask.shape ; device = adj_mask.device
-#     adj_and_hidden = torch.zeros((B, 1, 2*n, 2*n), dtype=torch.bool, device=device) # Create empty 2n x 2n adjacency
-
-#     # adj_and_hidden[:, :, :n, :n] = 1 # Upper-left block: fully connected except diagonal
-#     # adj_and_hidden[:, :, :n, :n].fill_diagonal_(0)  # diagonal is zero
-#     upper_left = torch.ones((B, n, n), dtype=torch.bool, device=device).fill_diagonal_(0)
-#     adj_and_hidden[:, 0, :n, :n] = upper_left
-
-#     # adj_and_hidden[:, :, n:, :n] = 1
-#     # adj_and_hidden[:, :, n:, :n].fill_diagonal_(0)
-#     lower_left = torch.ones((B, n, n), dtype=torch.bool, device=device).fill_diagonal_(0)
-#     adj_and_hidden[:, 0, n:, :n] = lower_left
-#     # new_adj = | 1 (no diag)   0 | for self-attention.
-#     #           | 1 (no diag)   0 |
-    
-
-
+        return F.mish(self.decoder_linear(out)), latent_rep_loss, l2_loss, l2_loss_normal, l2_loss_hidden, mean_rank, mean_hidden_rank
      

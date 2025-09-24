@@ -458,7 +458,25 @@ class Estimator(pl.LightningModule):
             
 
             h = self.node_edge_mlp(h)
+            h_original = h.clone()
+            num_edges, features_dim = h.shape
+            print(h.shape)
+
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
+            print(h.shape)
+
+            mask = (h != 0).all(dim=-1) # false when fill_value 
+            print(mask.shape)
+            # h_reconstructed = torch.zeros(num_edges, features_dim)
+            valid_mask = mask.unsqueeze(-1)   # Flatten to a vector of size [batch_size * max_num_nodes]
+            valid_h = h * valid_mask
+            valid_h = h[valid_mask.squeeze(-1)]
+
+            print(valid_h.shape, h_original.shape)
+            print(h_original)
+            print("ok now valid h")
+            print(valid_h)
+            print(F.mse_loss(h_original, valid_h))
 
             h_clone = h.clone()
             # print("h shape before", h.shape)
@@ -473,9 +491,28 @@ class Estimator(pl.LightningModule):
 
                 
                 # this is wrong implementation
-                masked_pred = enc_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = enc[masked_graphs_idx, masked_edges_idx]
+                masked_pred = enc_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = ((enc[masked_graphs_idx, masked_edges_idx]).detach()).clone()
                 # latent_rep_loss = F.mse_loss(enc_missing_edges, enc, reduction='sum') # Compute MSE for all the edges
-                latent_rep_loss = F.mse_loss(masked_pred, masked_target, reduction='mean') # Compute MSE only for the masked edges
+
+                mean_enc = enc_missing_edges.mean(dim=1, keepdim=True)
+                dist_l2 = ((enc_missing_edges - mean_enc) ** 2).sum(dim=2).sqrt()  # [B, N]
+                l2_loss = dist_l2.mean()
+
+                non_masked_mask = torch.ones_like(enc_missing_edges, dtype=torch.bool)
+                non_masked_mask[masked_graphs_idx, masked_edges_idx] = False
+                non_masked_enc = enc_missing_edges[non_masked_mask]
+
+                mean_enc_normal = non_masked_enc.mean(dim=1, keepdim=True)
+                dist_l2_normal = ((non_masked_enc - mean_enc_normal) ** 2).sum(dim=2).sqrt()  # [B, N]
+                l2_loss_normal = dist_l2_normal.mean()
+
+                mean_enc_hidden = masked_pred.mean(dim=1, keepdim=True)
+                dist_l2_hidden = ((masked_pred - mean_enc_hidden) ** 2).sum(dim=2).sqrt()  # [B, N]
+                l2_loss_hidden = dist_l2_hidden.mean()
+
+
+
+                latent_rep_loss = F.mse_loss(masked_pred, masked_target, reduction='sum') # Compute MSE only for the masked edges
                 # latent_rep_loss = 0.0
                 #latent_rep_loss = (F.mse_loss(h_missing_edges, h, reduction='none')).sum()  #.mean()
                 
@@ -505,7 +542,7 @@ class Estimator(pl.LightningModule):
                 h = h[dense_batch_index]
         
         predictions = self.output_mlp(torch.flatten(h, start_dim=1))
-        return predictions, latent_rep_loss, connectivity_loss
+        return predictions, latent_rep_loss, l2_loss, l2_loss_normal, l2_loss_hidden
     
 
     def configure_optimizers(self):
@@ -541,7 +578,7 @@ class Estimator(pl.LightningModule):
         batch = None,
     ):
   
-        predictions, latent_rep_loss, connectivity_loss = self.forward(x, edge_index, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, batch=batch)  
+        predictions, latent_rep_loss, l2_loss, l2_loss_normal, l2_loss_hidden = self.forward(x, edge_index, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, batch=batch)  
 
         if self.task_type == "multi_classification":
             predictions = predictions.reshape(-1, self.linear_output_size)
@@ -595,7 +632,7 @@ class Estimator(pl.LightningModule):
             # weighted sum with connectivity_loss and latent_loss
             # print(total_loss, latent_rep_loss, connectivity_loss) # to guess the proper scaling parameter, is it an issue ???
 
-        return total_loss, per_target_losses, latent_rep_loss, predictions, y
+        return total_loss, per_target_losses, latent_rep_loss, predictions, y, l2_loss, l2_loss_normal, l2_loss_hidden
         #return task_loss, predictions, y
 
 
@@ -624,10 +661,10 @@ class Estimator(pl.LightningModule):
         num_max_items = nearest_multiple_of_8(num_max_items + 1)
         # print(num_max_items, "num max items in _step")
 
-        task_loss, per_target_losses, latent_rep_loss, predictions, y = self._batch_loss(
+        task_loss, per_target_losses, latent_rep_loss, predictions, y, l2_loss, l2_loss_normal, l2_loss_hidden = self._batch_loss(
             x, edge_index, y, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, step_type=step_type, batch=batch
         )
-        latent_rep_loss = latent_rep_loss  #100000
+        latent_rep_loss = latent_rep_loss * 0.01  #100000
         # --- Logging the individual losses for regression ---
         if self.task_type == "regression" and self.linear_output_size > 1:
             for idx, target_name in enumerate(self.target_names):
@@ -643,6 +680,27 @@ class Estimator(pl.LightningModule):
         self.log(
             f"{step_type}_loss_latent_representation", 
             latent_rep_loss, 
+            prog_bar=False, 
+            batch_size=self.batch_size
+        )
+
+        self.log(
+            f"{step_type}_loss_rank_collapse", 
+            l2_loss, 
+            prog_bar=False, 
+            batch_size=self.batch_size
+        )
+
+        self.log(
+            f"{step_type}_normal_rank_collapse", 
+            l2_loss_normal, 
+            prog_bar=False, 
+            batch_size=self.batch_size
+        )
+
+        self.log(
+            f"{step_type}_hidden_rank_collapse", 
+            l2_loss_hidden, 
             prog_bar=False, 
             batch_size=self.batch_size
         )

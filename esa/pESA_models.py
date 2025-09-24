@@ -61,7 +61,7 @@ class hEstimator(pl.LightningModule):
         use_mlps: bool = False,
         set_max_items: int=0,
         regression_loss_fn: str = "mae",
-        early_stopping_patience: int = 30,
+        early_stopping_patience: int = 2,#30,
         optimiser_weight_decay: float = 1e-3,
         mlp_hidden_size: int = 64,
         mlp_type: str = "standard",
@@ -87,6 +87,7 @@ class hEstimator(pl.LightningModule):
 
         self.graph_dim = graph_dim
         self.task_type = task_type
+        self.number_train_epoch = 0
 
         # print(task_type) # prints regression ok
 
@@ -386,16 +387,14 @@ class hEstimator(pl.LightningModule):
                 hedge_nodes_tensor = torch.nn.utils.rnn.pad_sequence(all_hyperedges, batch_first=True, padding_value=-1)
                 mask = hedge_nodes_tensor != -1 ; valid_indices = hedge_nodes_tensor.clone() ; valid_indices[~mask] = 0 
                 features = x[valid_indices] * mask.unsqueeze(-1)
-                #; features = features * mask.unsqueeze(-1)
 
                 h_x_mean = features.sum(dim=1) / mask.sum(dim=1, keepdim=True)
                 h_hyperedge_output = torch.cat((h_x_mean, h_x_mean), dim=1)
 
-                num_hyperedges_per_graph = [len(h) for h in batch.hyperedges] #; print("HYPEREDGES USED")
+                num_hyperedges_per_graph = [len(h) for h in batch.hyperedges]
                 hedge_batch_index = torch.repeat_interleave(torch.arange(len(batch.hyperedges), device=x.device), torch.tensor(num_hyperedges_per_graph, device=x.device))
                 
-                # The final shape is [num_hyperedges, 2*n + e]
-                if self.edge_dim is not None and edge_attr is not None:   
+                if self.edge_dim is not None and edge_attr is not None:   # The final shape is [num_hyperedges, 2*n + e]
                     total_hyperedges = sum(len(graph_hyperedges) for graph_hyperedges in batch.hyperedges) 
                     hyperedge_attr_ones = torch.zeros((total_hyperedges, self.edge_dim), device=x.device, dtype=x.dtype) # this might be the issue
                     h_hyperedge_output = torch.cat((h_hyperedge_output, hyperedge_attr_ones), dim=1)
@@ -407,43 +406,41 @@ class hEstimator(pl.LightningModule):
                     perm = edge_batch_index.argsort()
                     h = h[perm] ; edge_batch_index = edge_batch_index[perm]
 
-            
-            
 
             h = self.node_edge_mlp(h)
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
-
-            
             # h = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
 
             latent_rep_loss = 0.0
             if self.train_missing_edge:
-                # print("train_missing_edge")
-                # target_connectivity = None
-                # h_missing_edges, masked_graphs_idx, masked_edges_idx = self.mask_one_edge_per_graph(h_clone) # to modify because now dense_batched
-                # here modify h to enclude the new masked clone
-                batch_size, max_num_nodes, feat_dim = h.size()
-                h_masked = h.clone()
+                _, _, feat_dim = h.size() ; h_masked = h.clone()
                 valid_mask = (h.abs().sum(dim=-1) != 0) # Identify valid (non-zero) nodes: shape [batch_size, max_num_nodes]
                 mask_token = self.shared_masking_token.view(1, -1)  # [1,1,feat_dim] # Expand shared_masking_token for broadcasting if needed
                 h_masked[valid_mask] = mask_token.expand(valid_mask.sum(), feat_dim) # Replace valid positions with masking token
                 h_and_hidden = torch.cat([h, h_masked], dim=1) # Concatenate on the first dimension
                 
-                # diff 128 x n x features and 64 x 2n x features
-                # print("shape of h_and_hidden", h_and_hidden.shape)
-                h_and_hidden, latent_rep_loss = self.st_fast_hidden(h_and_hidden, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
-                # print("after st fast")
-                
-                # already graph based representation B, G_out not B, E, F_out
-                # print(h_and_hidden.shape)
-                # h = h_and_hidden[:, :max_num_nodes, :]        # [B, N, F_out]
-                # h_masked = h_and_hidden[:, max_num_nodes:, :] # [B, N, F_out]
+                zero_mask = ~valid_mask # diff 128 x n x features and 64 x 2n x features
+                double_zero_mask = (torch.cat([zero_mask, zero_mask], dim=1))
+
+                h_and_hidden, latent_rep_loss, l2_loss, l2_normal, l2_loss_hidden, mean_eff_rank, mean_eff_hidden_rank = self.st_fast_hidden(h_and_hidden, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index, zero_mask=double_zero_mask)
+
                 h = h_and_hidden
-                latent_rep_loss = 0.0
-                
+
+                self.log(
+                    f"train_mean_eff_rank", 
+                    mean_eff_rank, 
+                    prog_bar=False, 
+                    batch_size=self.batch_size
+                )
+
+                self.log(
+                    f"train_mean_eff_hidden_rank", 
+                    mean_eff_hidden_rank, 
+                    prog_bar=False, 
+                    batch_size=self.batch_size
+                )
                 # need to decode with only the upper part for the predictions
                 # need to compare the upper enc part with below part enc.
-
 
                 # # masked_pred = h_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = h[masked_graphs_idx, masked_edges_idx]
                 # latent_rep_loss = F.mse_loss(h_masked, h, reduction='sum') # Compute MSE only for masked edges # should be mean 
@@ -459,8 +456,7 @@ class hEstimator(pl.LightningModule):
                 h = h[dense_batch_index]
         
         predictions = self.output_mlp(torch.flatten(h, start_dim=1))
-        # print("predictions done")
-        return predictions, latent_rep_loss
+        return predictions, latent_rep_loss, l2_loss, l2_normal, l2_loss_hidden
     
 
     def configure_optimizers(self):
@@ -496,7 +492,7 @@ class hEstimator(pl.LightningModule):
         batch = None,
     ):
   
-        predictions, latent_rep_loss = self.forward(x, edge_index, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, batch=batch)  
+        predictions, latent_rep_loss, l2_loss, l2_normal, l2_loss_hidden = self.forward(x, edge_index, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, batch=batch)  
 
         if self.task_type == "multi_classification":
             predictions = predictions.reshape(-1, self.linear_output_size)
@@ -550,7 +546,7 @@ class hEstimator(pl.LightningModule):
             # weighted sum with connectivity_loss and latent_loss
             # print(total_loss, latent_rep_loss, connectivity_loss) # to guess the proper scaling parameter, is it an issue ???
 
-        return total_loss, per_target_losses, latent_rep_loss, predictions, y
+        return total_loss, per_target_losses, latent_rep_loss, predictions, y, l2_loss, l2_normal, l2_loss_hidden
         #return task_loss, predictions, y
 
 
@@ -577,12 +573,11 @@ class hEstimator(pl.LightningModule):
 
         num_max_items = torch.max(num_max_items).item()
         num_max_items = nearest_multiple_of_8(num_max_items + 1)
-        # print(num_max_items, "num max items in _step")
 
-        task_loss, per_target_losses, latent_rep_loss, predictions, y = self._batch_loss(
+        task_loss, per_target_losses, latent_rep_loss, predictions, y, l2_loss, l2_normal, l2_loss_hidden= self._batch_loss(
             x, edge_index, y, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, step_type=step_type, batch=batch
         )
-        latent_rep_loss = latent_rep_loss  #100000
+        latent_rep_loss = latent_rep_loss #* 0.1 #100000
         # --- Logging the individual losses for regression ---
         if self.task_type == "regression" and self.linear_output_size > 1:
             for idx, target_name in enumerate(self.target_names):
@@ -601,6 +596,28 @@ class hEstimator(pl.LightningModule):
             prog_bar=False, 
             batch_size=self.batch_size
         )
+
+        self.log(
+            f"{step_type}_loss_rank_collapse", 
+            l2_loss, 
+            prog_bar=False, 
+            batch_size=self.batch_size
+        )
+
+        self.log(
+            f"{step_type}_normal_rank_collapse", 
+            l2_normal, 
+            prog_bar=False, 
+            batch_size=self.batch_size
+        )
+
+        self.log(
+            f"{step_type}_hidden_rank_collapse", 
+            l2_loss_hidden, 
+            prog_bar=False, 
+            batch_size=self.batch_size
+        )
+
 
         predictions = predictions.detach().squeeze()
 
@@ -626,11 +643,14 @@ class hEstimator(pl.LightningModule):
 
         if train_total_loss:
             self.log("train_loss", train_total_loss, prog_bar=True)
+
         
         # must normalise
-        train_total_loss += latent_rep_loss
+        if self.number_train_epoch > 0 :
+            train_total_loss += latent_rep_loss
         if train_total_loss:
             self.log("train_total_loss", train_total_loss, prog_bar=False)
+        # print("ok")
 
         return train_total_loss
 
@@ -847,6 +867,9 @@ class hEstimator(pl.LightningModule):
         self.train_metrics[self.current_epoch], y_pred, y_true = self._epoch_end_report(
             self.train_output[self.current_epoch], epoch_type="Train"
         )
+
+        print("ending train epoch")
+        self.number_train_epoch += 1
 
         del y_pred
         del y_true
