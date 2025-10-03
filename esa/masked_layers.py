@@ -427,6 +427,7 @@ class PMAComplete(nn.Module):
         if norm_type == "LN":
             self.norm = LN(dim_hidden)
         elif norm_type == "BN":
+            print(self.set_max_items, "here max items is")
             self.norm = BN(self.set_max_items)
 
         self.mlp_type = mlp_type
@@ -471,6 +472,7 @@ class PMAComplete(nn.Module):
         
         elif self.pre_or_post == "post" and out_attn.shape[-2] == X.shape[-2]:
             out = self.residual_attn(X, out_attn)
+            print(out.shape, "out shape before issue norm")
             out = self.norm(out)
         
         else:
@@ -722,6 +724,7 @@ class ESA(nn.Module):
             X = self.out_proj(X)
 
         enc = enc + X
+        # print("enc shape", enc.shape)
         
         # latent_rep_loss = 0.0 
 

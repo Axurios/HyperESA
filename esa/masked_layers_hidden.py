@@ -4,6 +4,7 @@ import admin_torch
 from torch import nn
 from torch.nn import functional as F
 from torch_geometric.utils import unbatch_edge_index
+from geomloss import SamplesLoss
 
 from utils.norm_layers import BN, LN
 from esa.mha import SAB, PMA
@@ -253,6 +254,87 @@ def batched_effective_rank(X: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
 
 
 
+# def compute_sinkhorn_distance_matrix(X, p=2, blur=0.005):
+#     """
+#     Compute symmetric pairwise Sinkhorn Wasserstein distance matrix.
+#     Args:   X (torch.Tensor): A tensor of shape (B, E, d) representing a batch of B point clouds, each with E points in d dimensions.
+#             p (int): The exponent in the cost function (default: 2).
+#             blur (float): The blur parameter for Sinkhorn (default: 0.005).
+#     Returns: torch.Tensor: A (B, B) symmetric matrix of pairwise Sinkhorn distances.
+#     """
+#     B, E, _ = X.shape ; device = X.device
+#     a = torch.ones(E, device=device) / E # Uniform weights
+#     loss_fn = SamplesLoss("sinkhorn", p=p, blur=blur)# Sinkhorn loss
+#     D = torch.zeros(B, B, device=device)# Distance matrix
+
+#     for i in range(B):
+#         for j in range(i + 1, B):
+#             dist = loss_fn(a, X[i], a, X[j])
+#             D[i, j] = dist ; D[j, i] = dist  # symmetric
+#     return D
+
+
+def compute_sinkhorn_distance_matrix(X, p=2, blur=0.05, scaling=0.95):
+    """
+    Fast, symmetric pairwise Sinkhorn Wasserstein distance matrix.
+    Args:  X: (B, E, d) tensor of point clouds
+    Returns: D: (B, B) symmetric matrix of Sinkhorn distances
+    """
+    B, E, d = X.shape ; device = X.device
+
+    a = torch.ones(E, device=device) / E
+    loss_fn = SamplesLoss("sinkhorn", p=p, blur=blur, scaling=0.9, backend="tensorized")
+    idx_i, idx_j = torch.triu_indices(B, B, offset=1)# Create Cartesian index pairs (i, j) for i < j
+    # Flattened input for vectorized loss computation # shape: (num_pairs, E, d)
+    X_i = X[idx_i] ; X_j = X[idx_j]  
+    dist = loss_fn(a.expand(X_i.shape[0], -1), X_i, a.expand(X_j.shape[0], -1), X_j)
+
+    # Fill symmetric distance matrix
+    D = torch.zeros(B, B, device=device)
+    D[idx_i, idx_j] = dist ; D[idx_j, idx_i] = dist
+    return D
+
+
+# def center_gram(K):
+#     n = K.size(0)
+#     H = torch.eye(n, device=K.device) - (1.0 / n) * torch.ones((n, n), device=K.device)
+#     return H @ K @ H
+
+# def gram_linear(X):
+#     return X @ X.T
+
+# def linear_CKA(X, Y):
+#     K = center_gram(gram_linear(X)) ; L = center_gram(gram_linear(Y))
+#     hsic = (K * L).sum()
+#     norm_K = (K * K).sum().sqrt() ; norm_L = (L * L).sum().sqrt()
+#     return hsic / (norm_K * norm_L)
+
+
+def linear_CKA(X, Y, eps=1e-8):
+    """
+    Compute linear CKA between two feature matrices X and Y.
+    Args: X, Y: (n x d1), (n x d2) input feature matrices (rows = samples)
+        eps: numerical stability epsilon
+    Returns: cka: scalar similarity in [0, 1]
+    """
+    K = X @ X.T ;  L = Y @ Y.T  # Compute Gram (dot product) matrices
+    K_mean_row = K.mean(dim=0, keepdim=True) ; K_mean_col = K.mean(dim=1, keepdim=True) ; K_mean = K.mean()
+    K_centered = K - K_mean_row - K_mean_col + K_mean
+
+    L_mean_row = L.mean(dim=0, keepdim=True) ; L_mean_col = L.mean(dim=1, keepdim=True) ; L_mean = L.mean()
+    L_centered = L - L_mean_row - L_mean_col + L_mean
+
+    hsic = (K_centered * L_centered).sum()# Compute HSIC numerator
+    norm_K = (K_centered * K_centered).sum().sqrt() ; norm_L = (L_centered * L_centered).sum().sqrt()
+    return hsic / (norm_K * norm_L + eps)
+
+
+
+
+
+
+
+
 
 class SABComplete(nn.Module):
     def __init__(
@@ -357,9 +439,11 @@ class SABComplete(nn.Module):
 
 
     def forward(self, inp):
-        X, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self = inp
+        X, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self, zero_mask = inp
         if self.pre_or_post == "pre":
             X = self.norm(X) # also work when hyperedges in x
+        
+        # print("before sab", X[zero_mask])
         if self.idx == 1:
             if hidden_adj_masked is not None:
                 out_attn = self.sab(X, hidden_adj_masked)
@@ -370,13 +454,14 @@ class SABComplete(nn.Module):
                 out_attn = self.sab(X, hidden_adj_self)
             else:
                 out_attn = self.sab(X)
-
+        
+        out_attn[zero_mask] = 0
         if out_attn.shape[-1] != X.shape[-1]:
             X = self.proj_1(X)
 
         if self.pre_or_post == "pre":
             out = X + out_attn
-
+            out[zero_mask] = 0
         if self.pre_or_post == "post":
             out = self.residual_attn(X, out_attn)
 
@@ -391,9 +476,11 @@ class SABComplete(nn.Module):
                 out2 = self.norm(out2)
                 # out = self.norm(out) # this is the issue line
                 out = torch.cat((out1,out2), dim=1)
+                out[zero_mask] = 0
             else:
+                print("there")
                 out = self.norm(out)
-
+        # print("after norm", out[zero_mask])
         if self.use_mlp:
             if self.pre_or_post == "pre":
                 out_mlp = self.norm_mlp(out)
@@ -401,7 +488,7 @@ class SABComplete(nn.Module):
 
                 if out.shape[-1] == out_mlp.shape[-1]:
                     out = out_mlp + out
-
+            out[zero_mask] = 0
 
             if self.pre_or_post == "post":
                 out_mlp = self.mlp(out)
@@ -420,13 +507,15 @@ class SABComplete(nn.Module):
 
                     # out = self.norm_mlp(out)
                     out = torch.cat((out1,out2), dim=1)
+                    out[zero_mask] = 0
                 else:
                     out = self.norm_mlp(out)
-
+                    out[zero_mask] = 0
+            # print("after post", out[zero_mask])
         if self.residual_dropout > 0:
             out = F.dropout(out, p=self.residual_dropout)
-
-        return out, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self
+        # print("after ALL", out[zero_mask])
+        return out, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self, zero_mask
 
 
 
@@ -477,8 +566,10 @@ class PMAComplete(nn.Module):
         self.pma = PMA(dim_hidden, num_heads, num_outputs, dropout, xformers_or_torch_attn)
 
         if norm_type == "LN":
+            print("LN", dim_hidden)
             self.norm = LN(dim_hidden)
         elif norm_type == "BN":
+            print("BN", self.set_max_items)
             self.norm = BN(self.set_max_items)
 
         self.mlp_type = mlp_type
@@ -511,7 +602,7 @@ class PMAComplete(nn.Module):
 
 
     def forward(self, inp):
-        X, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self = inp
+        X, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self, zero_mask = inp
 
         if self.pre_or_post == "pre":
             X = self.norm(X)
@@ -523,6 +614,8 @@ class PMAComplete(nn.Module):
         
         elif self.pre_or_post == "post" and out_attn.shape[-2] == X.shape[-2]:
             out = self.residual_attn(X, out_attn)
+            print("second there")
+            print(out.shape, "out shape")
             out = self.norm(out)
         
         else:
@@ -544,7 +637,7 @@ class PMAComplete(nn.Module):
         if self.residual_dropout > 0:
             out = F.dropout(out, p=self.residual_dropout)
 
-        return out, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self
+        return out, edge_index, batch_mapping, max_items, adj_mask, hidden_adj_masked, hidden_adj_self, zero_mask
 
 
 
@@ -658,6 +751,7 @@ class ESA_hidden(nn.Module):
         use_mlp_ln=False,
         set_max_items=0,
         use_bfloat16=True,
+        reconstruction=False,
     ):
         super(ESA_hidden, self).__init__()
 
@@ -682,7 +776,9 @@ class ESA_hidden(nn.Module):
         self.mlp_dropout = mlp_dropout
         self.use_mlp_ln = use_mlp_ln
         self.set_max_items = set_max_items
+        print(self.set_max_items, "max items init")
         self.use_bfloat16 = use_bfloat16
+        self.reconstruction = reconstruction
         
         layer_tracker = 0
 
@@ -826,6 +922,59 @@ class ESA_hidden(nn.Module):
 
             self.dim_pma = dim_pma
 
+        if self.reconstruction:
+            print("ready to reconstruct")
+
+            reversed_layer_types = self.layer_types[::-1]
+            reversed_dims = self.dim_hidden[::-1]
+            reversed_heads = self.num_heads[::-1]
+
+            layer_tracker = 0
+            self.reconstructor = []
+
+            for i, lt in enumerate(reversed_layer_types):
+                layer_in_dim = reversed_dims[layer_tracker]
+                if i + 1 < len(reversed_dims):
+                    layer_out_dim = reversed_dims[layer_tracker + 1]
+                else:
+                    layer_out_dim = reversed_dims[layer_tracker]
+
+                layer_num_heads = reversed_heads[layer_tracker]
+
+
+
+                if lt == "S" or lt == "M":
+                    self.reconstructor.append(
+                        SABComplete(
+                            layer_in_dim,
+                            layer_out_dim,
+                            layer_num_heads, 
+                            idx=999 - i,  # optional: to distinguish from encoder
+                            dropout=self.sab_dropout if lt == "S" else self.mab_dropout,
+                            node_or_edge=self.node_or_edge,
+                            xformers_or_torch_attn=self.xformers_or_torch_attn,
+                            pre_or_post=self.pre_or_post,
+                            residual_dropout=self.residual_dropout,
+                            use_mlp=self.use_mlps,
+                            mlp_hidden_size=self.mlp_hidden_size,
+                            mlp_dropout=self.mlp_dropout,
+                            num_mlp_layers=self.num_mlp_layers,
+                            use_mlp_ln=self.use_mlp_ln,
+                            norm_type=self.norm_type,
+                            mlp_type=self.mlp_type,
+                            set_max_items=self.set_max_items,
+                            use_bfloat16=self.use_bfloat16,
+                            num_layers_for_residual=len(self.dim_hidden) * 2,
+                        )
+                    )
+                    print(f"Added reconstructor {lt} ({layer_in_dim}, {layer_out_dim}, {layer_num_heads})")
+                    
+                if lt == "P":
+                    print("PMA ENCOUNTERED !!!!!!!")
+                layer_tracker += 1
+
+            self.reconstructor = nn.Sequential(*self.reconstructor)
+
 
     def forward(self, X, edge_index, batch_mapping, num_max_items, is_using_hyperedges=False, hyperedge_index=None, hedge_batch_index=None, zero_mask=None):
 
@@ -842,9 +991,10 @@ class ESA_hidden(nn.Module):
                 hyperedge_index=hyperedge_index,
                 hedge_batch_index=hedge_batch_index,
             )
-
-            hidden_adj_masked = add_hidden_adj_masked(adj_mask, xformers_or_torch_attn=self.xformers_or_torch_attn, use_bfloat16=self.use_bfloat16, zero_mask = zero_mask)
-            hidden_adj_self = add_hidden_adj_self(adj_mask, xformers_or_torch_attn=self.xformers_or_torch_attn, use_bfloat16=self.use_bfloat16, zero_mask = zero_mask)
+            hidden_adj_masked = None; hidden_adj_self = None
+            if zero_mask is not None:
+                hidden_adj_masked = add_hidden_adj_masked(adj_mask, xformers_or_torch_attn=self.xformers_or_torch_attn, use_bfloat16=self.use_bfloat16, zero_mask = zero_mask)
+                hidden_adj_self = add_hidden_adj_self(adj_mask, xformers_or_torch_attn=self.xformers_or_torch_attn, use_bfloat16=self.use_bfloat16, zero_mask = zero_mask)
 
         # elif self.node_or_edge == "node":
         #     adj_mask = get_adj_mask_from_edge_index_node(
@@ -859,8 +1009,10 @@ class ESA_hidden(nn.Module):
         # issue is when is_using_hyperedges, adj_mask contains the hyperedges connectivity, but the edge_index and the batch_mapping don't
         # batch_mapping links node with graphs, so not an issue
         # # # the true issue is edge_index which is only edges, not hyperedges
- 
-        enc, _, _, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask, hidden_adj_masked, hidden_adj_self))
+        if hidden_adj_masked is not None and hidden_adj_self is not None :
+            enc, _, _, _, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask, hidden_adj_masked, hidden_adj_self, zero_mask))
+        else:
+            enc, _, _, _, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask, None, None, zero_mask))
 
         if hasattr(self, "dim_pma") and self.dim_hidden[0] != self.dim_pma:
             X = self.out_proj(X)
@@ -872,24 +1024,43 @@ class ESA_hidden(nn.Module):
         _, max_num_enc, _ = enc.shape ; max_num_enc_div = max_num_enc//2
         enc_normal = enc[:, :max_num_enc_div, :] ; enc_hidden = enc[:, max_num_enc_div:, :]  
 
-        # ranks = torch.linalg.matrix_rank(enc_normal)
-        normal_ranks = batched_effective_rank(enc_normal) ; hidden_ranks = batched_effective_rank(enc_hidden)
-        mean_rank = normal_ranks.float().mean().detach() ; mean_hidden_rank = hidden_ranks.mean().detach()
 
-        
-        mean_enc = enc.mean(dim=1, keepdim=True) ; dist_l2 = ((enc - mean_enc) ** 2).sum(dim=2).sqrt() ; l2_loss = dist_l2.mean().detach()
-        mean_enc_normal = enc_normal.mean(dim=1, keepdim=True) ; dist_l2_normal = ((enc_normal - mean_enc_normal) ** 2).sum(dim=2).sqrt() ; l2_loss_normal = dist_l2_normal.mean().detach()
-        mean_enc_hidden = enc_hidden.mean(dim=1, keepdim=True) ; dist_l2_hidden = ((enc_hidden - mean_enc_hidden) ** 2).sum(dim=2).sqrt() ; l2_loss_hidden = dist_l2_hidden.mean().detach()
+        ## -- Observatory --
+        l2_loss, l2_loss_normal, l2_loss_hidden, mean_rank, mean_hidden_rank = 0,0,0,0,0
+        #with torch.no_grad():
+            # normal_ranks = batched_effective_rank(enc_normal) ; hidden_ranks = batched_effective_rank(enc_hidden)
+            # mean_rank = normal_ranks.float().mean().detach() ; mean_hidden_rank = hidden_ranks.mean().detach()
+
+            # mean_enc = enc.mean(dim=1, keepdim=True) ; dist_l2 = ((enc - mean_enc) ** 2).sum(dim=2).sqrt() ; l2_loss = dist_l2.mean().detach()
+            # mean_enc_normal = enc_normal.mean(dim=1, keepdim=True) ; dist_l2_normal = ((enc_normal - mean_enc_normal) ** 2).sum(dim=2).sqrt() ; l2_loss_normal = dist_l2_normal.mean().detach()
+            # mean_enc_hidden = enc_hidden.mean(dim=1, keepdim=True) ; dist_l2_hidden = ((enc_hidden - mean_enc_hidden) ** 2).sum(dim=2).sqrt() ; l2_loss_hidden = dist_l2_hidden.mean().detach()
+
+        #     Dist_wasserstein_normal = compute_sinkhorn_distance_matrix(enc_normal)
+        #     Dist_wasserstein_hidden = compute_sinkhorn_distance_matrix(enc_hidden)
+            # cka_score = linear_CKA(Dist_wasserstein_normal, Dist_wasserstein_hidden)
+        cka_score = 0
+        ## ----------------
 
         enc_target = (enc_normal.detach()).clone()
         latent_rep_loss = F.mse_loss(enc_hidden, enc_target, reduction='mean')   # here we compare enc_normal and enc_hidden
 
         if hasattr(self, "decoder"):
             # out, _, _, _, _, _, _ = self.decoder((enc, edge_index, batch_mapping, num_max_items, adj_mask, hidden_adj_masked, hidden_adj_self))
-            out, _, _, _, _, _, _ = self.decoder((enc_normal, edge_index, batch_mapping, num_max_items, adj_mask, None, None))
+            out, _, _, _, _, _, _, _ = self.decoder((enc_normal, edge_index, batch_mapping, num_max_items, adj_mask, None, None, zero_mask))
             out = out.mean(dim=1)
         else:
             out = enc_normal
 
-        return F.mish(self.decoder_linear(out)), latent_rep_loss, l2_loss, l2_loss_normal, l2_loss_hidden, mean_rank, mean_hidden_rank
+        if hasattr(self, "reconstructor"):
+            # goes from enc.shape to 
+            # print("going to reconstruct")
+            enc_for_reconstruction = enc.detach().clone()
+            enc_for_reconstruction[zero_mask] = 0
+            reconstructed, _, _, _, _, _, _, _ = self.reconstructor((enc_for_reconstruction, edge_index, batch_mapping, num_max_items, adj_mask, hidden_adj_masked, hidden_adj_self, zero_mask))
+            reconstructed[zero_mask] = 0
+        else:
+            print("no reconstructor...")
+            reconstructed=None
+
+        return F.mish(self.decoder_linear(out)), latent_rep_loss, reconstructed, (l2_loss, l2_loss_normal, l2_loss_hidden, mean_rank, mean_hidden_rank, cka_score)
      

@@ -37,6 +37,13 @@ def nearest_multiple_of_8(n):
 
 
 
+
+
+
+
+
+
+
 class hEstimator(pl.LightningModule):
     def __init__(
         self,
@@ -114,6 +121,7 @@ class hEstimator(pl.LightningModule):
         self.mlp_hidden_size = mlp_hidden_size
         self.norm_type = norm_type
         self.set_max_items = set_max_items
+        print("initial set_mas_items", self.set_max_items)
         self.output_save_dir = output_save_dir
         self.is_node_task = is_node_task
         self.use_mlp_ln = use_mlp_ln
@@ -175,6 +183,8 @@ class hEstimator(pl.LightningModule):
 
         self.rwse_encoder = None
         self.lap_encoder = None
+
+        self.reconstruction = kwargs.get('reconstruction', False)
 
         if "RWSE" in self.posenc:
             self.rwse_encoder = KernelPENodeEncoder()
@@ -239,6 +249,15 @@ class hEstimator(pl.LightningModule):
                     num_layers=self.num_mlp_layers,
                 )
 
+                self.node_edge_mlp_reverse = SmallMLP(
+                    in_dim=self.hidden_dims[0],
+                    inter_dim=128,          # could be the same or different
+                    out_dim=in_dim,
+                    use_ln=False,
+                    dropout_p=0,
+                    num_layers=self.num_mlp_layers,
+                )
+
             # Uncomment if you want the gated MLP here
 
             # elif self.mlp_type == "gated_mlp":
@@ -253,7 +272,8 @@ class hEstimator(pl.LightningModule):
             
 
         self.mlp_norm = norm_fn(self.hidden_dims[0])
-
+        
+        print("set_max_items", nearest_multiple_of_8(self.set_max_items + 1))
         st_args = dict(
             num_outputs=32, # this is the k for PMA
             dim_output=self.graph_dim,
@@ -277,6 +297,7 @@ class hEstimator(pl.LightningModule):
             pma_residual_dropout=self.pma_residual_dropout,
             use_mlp_ln=self.use_mlp_ln,
             mlp_dropout=self.mlp_dropout,
+            reconstruction=self.reconstruction
         )
 
         self.st_fast_hidden = ESA_hidden(**st_args)
@@ -406,45 +427,48 @@ class hEstimator(pl.LightningModule):
                     perm = edge_batch_index.argsort()
                     h = h[perm] ; edge_batch_index = edge_batch_index[perm]
 
-
+            # here the h i want
+            with torch.no_grad():
+                h_before = h.detach().clone()
+                h_before, _ = to_dense_batch(h_before, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
+            
+            # h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
             h = self.node_edge_mlp(h)
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
             # h = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
 
             latent_rep_loss = 0.0
+
+
+            
+
             if self.train_missing_edge:
                 _, _, feat_dim = h.size() ; h_masked = h.clone()
+                # valid_mask = (h.abs().sum(dim=-1) != 0) # Identify valid (non-zero) nodes: shape [batch_size, max_num_nodes]
                 valid_mask = (h.abs().sum(dim=-1) != 0) # Identify valid (non-zero) nodes: shape [batch_size, max_num_nodes]
+                zero_mask = ~valid_mask
                 mask_token = self.shared_masking_token.view(1, -1)  # [1,1,feat_dim] # Expand shared_masking_token for broadcasting if needed
                 h_masked[valid_mask] = mask_token.expand(valid_mask.sum(), feat_dim) # Replace valid positions with masking token
                 h_and_hidden = torch.cat([h, h_masked], dim=1) # Concatenate on the first dimension
                 
-                zero_mask = ~valid_mask # diff 128 x n x features and 64 x 2n x features
+                # zero_mask = ~valid_mask # diff 128 x n x features and 64 x 2n x features
                 double_zero_mask = (torch.cat([zero_mask, zero_mask], dim=1))
+                
 
-                h_and_hidden, latent_rep_loss, l2_loss, l2_normal, l2_loss_hidden, mean_eff_rank, mean_eff_hidden_rank = self.st_fast_hidden(h_and_hidden, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index, zero_mask=double_zero_mask)
-
+                # print("h_and_hidden shape before", h_and_hidden.shape)# need to decode with only the upper part for the predictions # need to compare the upper enc part with below part enc.
+                h_and_hidden, latent_rep_loss, reconstructed, observations = self.st_fast_hidden(h_and_hidden, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index, zero_mask=double_zero_mask)
                 h = h_and_hidden
-
-                self.log(
-                    f"train_mean_eff_rank", 
-                    mean_eff_rank, 
-                    prog_bar=False, 
-                    batch_size=self.batch_size
-                )
-
-                self.log(
-                    f"train_mean_eff_hidden_rank", 
-                    mean_eff_hidden_rank, 
-                    prog_bar=False, 
-                    batch_size=self.batch_size
-                )
-                # need to decode with only the upper part for the predictions
-                # need to compare the upper enc part with below part enc.
-
-                # # masked_pred = h_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = h[masked_graphs_idx, masked_edges_idx]
-                # latent_rep_loss = F.mse_loss(h_masked, h, reduction='sum') # Compute MSE only for masked edges # should be mean 
-
+                
+                # print("reconstructed shape", reconstructed.shape)
+                # print("zero mask of h_before", h_before[zero_mask])
+                if reconstructed is not None :
+                    reconstructed = self.node_edge_mlp_reverse(reconstructed)
+                    h_before_double = torch.cat([h_before, h_before], dim=1).detach()
+                    loss_reconstructed = F.mse_loss(reconstructed, h_before_double, reduction='mean')
+                else :
+                    loss_reconstructed = 0
+            else:
+                h = self.st_fast_hidden(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
                 
                 
         # NSA
@@ -456,7 +480,7 @@ class hEstimator(pl.LightningModule):
                 h = h[dense_batch_index]
         
         predictions = self.output_mlp(torch.flatten(h, start_dim=1))
-        return predictions, latent_rep_loss, l2_loss, l2_normal, l2_loss_hidden
+        return predictions, latent_rep_loss, loss_reconstructed, observations # l2_loss, l2_normal, l2_loss_hidden
     
 
     def configure_optimizers(self):
@@ -492,8 +516,8 @@ class hEstimator(pl.LightningModule):
         batch = None,
     ):
   
-        predictions, latent_rep_loss, l2_loss, l2_normal, l2_loss_hidden = self.forward(x, edge_index, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, batch=batch)  
-
+        predictions, latent_rep_loss, loss_reconstructed, observations = self.forward(x, edge_index, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, batch=batch)  
+        
         if self.task_type == "multi_classification":
             predictions = predictions.reshape(-1, self.linear_output_size)
 
@@ -546,7 +570,7 @@ class hEstimator(pl.LightningModule):
             # weighted sum with connectivity_loss and latent_loss
             # print(total_loss, latent_rep_loss, connectivity_loss) # to guess the proper scaling parameter, is it an issue ???
 
-        return total_loss, per_target_losses, latent_rep_loss, predictions, y, l2_loss, l2_normal, l2_loss_hidden
+        return total_loss, per_target_losses, latent_rep_loss, predictions, y, observations, loss_reconstructed
         #return task_loss, predictions, y
 
 
@@ -574,10 +598,10 @@ class hEstimator(pl.LightningModule):
         num_max_items = torch.max(num_max_items).item()
         num_max_items = nearest_multiple_of_8(num_max_items + 1)
 
-        task_loss, per_target_losses, latent_rep_loss, predictions, y, l2_loss, l2_normal, l2_loss_hidden= self._batch_loss(
+        task_loss, per_target_losses, latent_rep_loss, predictions, y, observations, loss_reconstructed = self._batch_loss(
             x, edge_index, y, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, step_type=step_type, batch=batch
         )
-        latent_rep_loss = latent_rep_loss #* 0.1 #100000
+        latent_rep_loss = latent_rep_loss * 0.1 #100000
         # --- Logging the individual losses for regression ---
         if self.task_type == "regression" and self.linear_output_size > 1:
             for idx, target_name in enumerate(self.target_names):
@@ -590,6 +614,9 @@ class hEstimator(pl.LightningModule):
                     batch_size=self.batch_size
                 )
         
+
+
+        l2_loss, l2_normal, l2_loss_hidden, mean_eff_rank, mean_eff_hidden_rank, cka_score = observations
         self.log(
             f"{step_type}_loss_latent_representation", 
             latent_rep_loss, 
@@ -618,6 +645,34 @@ class hEstimator(pl.LightningModule):
             batch_size=self.batch_size
         )
 
+        self.log(
+            f"train_mean_eff_rank", 
+            mean_eff_rank, 
+            prog_bar=False, 
+            batch_size=self.batch_size
+        )
+
+        self.log(
+            f"train_mean_eff_hidden_rank", 
+            mean_eff_hidden_rank, 
+            prog_bar=False, 
+            batch_size=self.batch_size
+        )
+
+        self.log(
+            f"train_batch_latents_cka_score", 
+            cka_score, 
+            prog_bar=False, 
+            batch_size=self.batch_size
+        )
+
+        self.log(
+            f"train_loss_reconstructed", 
+            loss_reconstructed, 
+            prog_bar=False, 
+            batch_size=self.batch_size
+        )
+
 
         predictions = predictions.detach().squeeze()
 
@@ -635,40 +690,37 @@ class hEstimator(pl.LightningModule):
         elif step_type == "test":
             self.test_output[self.num_called_test].append(output)
         
-        return task_loss, latent_rep_loss
+
+        # must normalise
+        if self.number_train_epoch >= 0 :
+            # task_loss += latent_rep_loss
+            task_loss += loss_reconstructed
+        
+        return task_loss
 
 
     def training_step(self, batch: torch.Tensor, batch_idx: int):
-        train_total_loss, latent_rep_loss = self._step(batch, "train")
-
-        if train_total_loss:
-            self.log("train_loss", train_total_loss, prog_bar=True)
-
-        
-        # must normalise
-        if self.number_train_epoch > 0 :
-            train_total_loss += latent_rep_loss
-        if train_total_loss:
-            self.log("train_total_loss", train_total_loss, prog_bar=False)
+        train_total_loss = self._step(batch, "train")
+        # if train_total_loss:
+        self.log("train_loss", train_total_loss, prog_bar=True)
         # print("ok")
-
         return train_total_loss
 
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int, dataloader_idx: int = 0):
         if dataloader_idx == 0:
-            val_total_loss, latent_rep_loss = self._step(batch, "validation")
+            val_total_loss = self._step(batch, "validation")
             self.log("val_loss", val_total_loss)
             return val_total_loss
 
         if dataloader_idx == 1:
-            val_test_total_loss, latent_rep_loss = self._step(batch, "validation_test")
+            val_test_total_loss = self._step(batch, "validation_test")
             self.log("val_test_loss", val_test_total_loss)
             return val_test_total_loss
 
 
     def test_step(self, batch: torch.Tensor, batch_idx: int):
-        test_total_loss, latent_rep_loss = self._step(batch, "test")
+        test_total_loss = self._step(batch, "test")
         self.log("test_loss", test_total_loss)
         return test_total_loss
 
@@ -680,6 +732,8 @@ class hEstimator(pl.LightningModule):
         y_true = torch.cat([item[1] for item in epoch_outputs], dim=0)
 
         # y_pred and y_true should now have shape [total_samples, linear_output_size]
+        # print(y_pred.shape)
+        # print(y_true.shape)
         
         # We need to make sure the scaler logic is also using the right shape
         if self.scaler:
@@ -750,117 +804,7 @@ class hEstimator(pl.LightningModule):
                 self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
         
         return metrics, y_pred, y_true
-    
 
-        # def flatten_list_of_tensors(lst):
-        #     try:
-        #         return np.array([item.item() for sublist in lst for item in sublist])
-        #     except:
-        #         return torch.cat(lst, dim=0)
-
-        # if self.task_type == "regression":
-        #     y_pred = flatten_list_of_tensors([item[0] for item in epoch_outputs]).reshape(-1, self.linear_output_size)
-        #     y_true = flatten_list_of_tensors([item[1] for item in epoch_outputs]).reshape(-1, self.linear_output_size)
-        # else:
-        #     if self.batch_size > 1:
-        #         y_pred = torch.cat([item[0] for item in epoch_outputs], dim=0)
-        #         y_true = torch.cat([item[1] for item in epoch_outputs], dim=0)
-        #     else:
-        #         y_pred = torch.cat([item[0].unsqueeze(0) for item in epoch_outputs], dim=0).squeeze()
-        #         y_true = torch.cat([item[1].unsqueeze(0) for item in epoch_outputs], dim=0).squeeze()
-
-        # if self.scaler:
-        #     if self.linear_output_size > 1:
-        #         y_pred = self.scaler.inverse_transform(y_pred.reshape(-1, self.linear_output_size))
-        #         y_true = self.scaler.inverse_transform(y_true.reshape(-1, self.linear_output_size))
-        #     else:
-        #         y_pred = self.scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
-        #         y_true = self.scaler.inverse_transform(y_true.reshape(-1, 1)).flatten()
-
-        #     y_pred = torch.from_numpy(y_pred)
-        #     y_true = torch.from_numpy(y_true)
-
-        # if self.task_type == "binary_classification" and self.linear_output_size > 1:
-        #     y_true = y_true.detach().cpu().reshape(-1, self.linear_output_size).long()
-        #     y_pred = y_pred.detach().cpu().reshape(-1, self.linear_output_size)
-
-        #     metrics = get_cls_metrics_multilabel_pt(y_true, y_pred, self.linear_output_size)
-
-        #     self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
-        #     self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
-        #     self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
-        #     self.log(f"{epoch_type} F1", metrics[3], batch_size=self.batch_size)
-
-        # elif self.task_type == "binary_classification" and self.linear_output_size == 1:
-        #     metrics = get_cls_metrics_binary_pt(y_true, y_pred)
-
-        #     self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
-        #     self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
-        #     self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
-        #     self.log(f"{epoch_type} F1", metrics[3], batch_size=self.batch_size)
-
-        # elif self.task_type == "multi_classification" and self.linear_output_size > 1:
-        #     metrics = get_cls_metrics_multiclass_pt(y_true, y_pred, self.linear_output_size)
-
-        #     self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
-        #     self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
-        #     self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
-        #     self.log(f"{epoch_type} F1", metrics[3], batch_size=self.batch_size)
-        #     self.log(f"{epoch_type} AP", metrics[4], batch_size=self.batch_size)
-
-        # elif self.task_type == "regression":
-        #     if self.linear_output_size > 1 and self.target_names is not None:
-        #     # --- START of changed code ---
-        #     # Loop over each target name and its corresponding column index
-        #         for idx, target_name in enumerate(self.target_names):
-                    
-        #             # Extract predictions and true values for this specific target
-        #             target_y_pred = y_pred.squeeze()[:, idx]
-        #             target_y_true = y_true.squeeze()[:, idx]
-                    
-        #             # Calculate metrics for this single target
-        #             metrics = get_regr_metrics_pt(target_y_true, target_y_pred)
-
-        #             # Log the individual metrics
-        #             self.log(f"{epoch_type} {target_name} R2", metrics["R2"], batch_size=self.batch_size)
-        #             self.log(f"{epoch_type} {target_name} MAE", metrics["MAE"], batch_size=self.batch_size)
-        #             self.log(f"{epoch_type} {target_name} RMSE", metrics["RMSE"], batch_size=self.batch_size)
-        #             self.log(f"{epoch_type} {target_name} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
-                
-        #         # Calculate and log the average MAE across all targets
-        #         mae_values = [get_regr_metrics_pt(y_true.squeeze()[:, idx], y_pred.squeeze()[:, idx])["MAE"] for idx in range(self.linear_output_size)]
-        #         mae_avg = np.mean(np.array(mae_values))
-        #         self.log(f"{epoch_type} AVERAGE MAE", mae_avg, batch_size=self.batch_size)
-        #         # --- END of changed code ---
-            
-        #     # if self.linear_output_size != 11:
-        #     #     metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
-
-        #     #     self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
-        #     #     self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
-        #     #     self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
-        #     #     self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
-        #     else:
-        #         metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
-        #         self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
-        #         self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
-        #         self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
-        #         self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
-        #         # mae_avg = []
-        #         # for idx in range(11):
-        #         #     target_name = pept_struct_target_names[idx]
-        #         #     metrics = get_regr_metrics_pt(y_true.squeeze()[:, idx], y_pred.squeeze()[:, idx])
-
-        #         #     mae_avg.append(metrics["MAE"])
-
-        #         #     self.log(f"{epoch_type} {target_name} R2", metrics["R2"], batch_size=self.batch_size)
-        #         #     self.log(f"{epoch_type} {target_name} MAE", metrics["MAE"], batch_size=self.batch_size)
-        #         #     self.log(f"{epoch_type} {target_name} RMSE", metrics["RMSE"], batch_size=self.batch_size)
-        #         #     self.log(f"{epoch_type} {target_name} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
-
-        #         # mae_avg = np.mean(np.array(mae_avg))
-        #         # self.log(f"{epoch_type} AVERAGE MAE", mae_avg, batch_size=self.batch_size)
-        # return metrics, y_pred, y_true
 
 
     def on_train_epoch_end(self):
@@ -868,7 +812,11 @@ class hEstimator(pl.LightningModule):
             self.train_output[self.current_epoch], epoch_type="Train"
         )
 
-        print("ending train epoch")
+        # print("ending train epoch")
+        
+        print(f"  - y_pred shape: {y_pred.shape}, dtype: {y_pred.dtype}")
+        print(f"  - y_true shape: {y_true.shape}, dtype: {y_true.dtype}")
+        print(f"  - Train metrics: {self.train_metrics[self.current_epoch]}")
         self.number_train_epoch += 1
 
         del y_pred
@@ -881,7 +829,8 @@ class hEstimator(pl.LightningModule):
             self.val_metrics[self.current_epoch], y_pred, y_true = self._epoch_end_report(
                 self.val_output[self.current_epoch], epoch_type="Validation"
             )
-
+            print(f"  - y_pred shape: {y_pred.shape}, y_true shape: {y_true.shape}")
+            print(f"  - Validation metrics: {self.val_metrics[self.current_epoch]}")
             del y_pred
             del y_true
             del self.val_output[self.current_epoch]
@@ -903,6 +852,9 @@ class hEstimator(pl.LightningModule):
         )
         self.test_output[self.num_called_test] = y_pred
         self.test_true[self.num_called_test] = y_true
+
+        print(f"  - y_pred shape: {y_pred.shape}, y_true shape: {y_true.shape}")
+        print(f"  - ValidationTest metrics: {self.val_test_metrics[self.current_epoch]}")
 
         self.num_called_test += 1
 
@@ -1023,3 +975,116 @@ class hEstimator(pl.LightningModule):
                     #     torch.full((len(graph_hyperedge),), i, device=x.device, dtype=torch.long)
                     #     for i, graph_hyperedge in enumerate(batch.hyperedges)
                     # ])
+
+
+    
+
+        # def flatten_list_of_tensors(lst):
+        #     try:
+        #         return np.array([item.item() for sublist in lst for item in sublist])
+        #     except:
+        #         return torch.cat(lst, dim=0)
+
+        # if self.task_type == "regression":
+        #     y_pred = flatten_list_of_tensors([item[0] for item in epoch_outputs]).reshape(-1, self.linear_output_size)
+        #     y_true = flatten_list_of_tensors([item[1] for item in epoch_outputs]).reshape(-1, self.linear_output_size)
+        # else:
+        #     if self.batch_size > 1:
+        #         y_pred = torch.cat([item[0] for item in epoch_outputs], dim=0)
+        #         y_true = torch.cat([item[1] for item in epoch_outputs], dim=0)
+        #     else:
+        #         y_pred = torch.cat([item[0].unsqueeze(0) for item in epoch_outputs], dim=0).squeeze()
+        #         y_true = torch.cat([item[1].unsqueeze(0) for item in epoch_outputs], dim=0).squeeze()
+
+        # if self.scaler:
+        #     if self.linear_output_size > 1:
+        #         y_pred = self.scaler.inverse_transform(y_pred.reshape(-1, self.linear_output_size))
+        #         y_true = self.scaler.inverse_transform(y_true.reshape(-1, self.linear_output_size))
+        #     else:
+        #         y_pred = self.scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
+        #         y_true = self.scaler.inverse_transform(y_true.reshape(-1, 1)).flatten()
+
+        #     y_pred = torch.from_numpy(y_pred)
+        #     y_true = torch.from_numpy(y_true)
+
+        # if self.task_type == "binary_classification" and self.linear_output_size > 1:
+        #     y_true = y_true.detach().cpu().reshape(-1, self.linear_output_size).long()
+        #     y_pred = y_pred.detach().cpu().reshape(-1, self.linear_output_size)
+
+        #     metrics = get_cls_metrics_multilabel_pt(y_true, y_pred, self.linear_output_size)
+
+        #     self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} F1", metrics[3], batch_size=self.batch_size)
+
+        # elif self.task_type == "binary_classification" and self.linear_output_size == 1:
+        #     metrics = get_cls_metrics_binary_pt(y_true, y_pred)
+
+        #     self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} F1", metrics[3], batch_size=self.batch_size)
+
+        # elif self.task_type == "multi_classification" and self.linear_output_size > 1:
+        #     metrics = get_cls_metrics_multiclass_pt(y_true, y_pred, self.linear_output_size)
+
+        #     self.log(f"{epoch_type} AUROC", metrics[0], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} MCC", metrics[1], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} Accuracy", metrics[2], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} F1", metrics[3], batch_size=self.batch_size)
+        #     self.log(f"{epoch_type} AP", metrics[4], batch_size=self.batch_size)
+
+        # elif self.task_type == "regression":
+        #     if self.linear_output_size > 1 and self.target_names is not None:
+        #     # --- START of changed code ---
+        #     # Loop over each target name and its corresponding column index
+        #         for idx, target_name in enumerate(self.target_names):
+                    
+        #             # Extract predictions and true values for this specific target
+        #             target_y_pred = y_pred.squeeze()[:, idx]
+        #             target_y_true = y_true.squeeze()[:, idx]
+                    
+        #             # Calculate metrics for this single target
+        #             metrics = get_regr_metrics_pt(target_y_true, target_y_pred)
+
+        #             # Log the individual metrics
+        #             self.log(f"{epoch_type} {target_name} R2", metrics["R2"], batch_size=self.batch_size)
+        #             self.log(f"{epoch_type} {target_name} MAE", metrics["MAE"], batch_size=self.batch_size)
+        #             self.log(f"{epoch_type} {target_name} RMSE", metrics["RMSE"], batch_size=self.batch_size)
+        #             self.log(f"{epoch_type} {target_name} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
+                
+        #         # Calculate and log the average MAE across all targets
+        #         mae_values = [get_regr_metrics_pt(y_true.squeeze()[:, idx], y_pred.squeeze()[:, idx])["MAE"] for idx in range(self.linear_output_size)]
+        #         mae_avg = np.mean(np.array(mae_values))
+        #         self.log(f"{epoch_type} AVERAGE MAE", mae_avg, batch_size=self.batch_size)
+        #         # --- END of changed code ---
+            
+        #     # if self.linear_output_size != 11:
+        #     #     metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
+
+        #     #     self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
+        #     #     self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
+        #     #     self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
+        #     #     self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
+        #     else:
+        #         metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
+        #         self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
+        #         self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
+        #         self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
+        #         self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
+        #         # mae_avg = []
+        #         # for idx in range(11):
+        #         #     target_name = pept_struct_target_names[idx]
+        #         #     metrics = get_regr_metrics_pt(y_true.squeeze()[:, idx], y_pred.squeeze()[:, idx])
+
+        #         #     mae_avg.append(metrics["MAE"])
+
+        #         #     self.log(f"{epoch_type} {target_name} R2", metrics["R2"], batch_size=self.batch_size)
+        #         #     self.log(f"{epoch_type} {target_name} MAE", metrics["MAE"], batch_size=self.batch_size)
+        #         #     self.log(f"{epoch_type} {target_name} RMSE", metrics["RMSE"], batch_size=self.batch_size)
+        #         #     self.log(f"{epoch_type} {target_name} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
+
+        #         # mae_avg = np.mean(np.array(mae_avg))
+        #         # self.log(f"{epoch_type} AVERAGE MAE", mae_avg, batch_size=self.batch_size)
+        # return metrics, y_pred, y_true

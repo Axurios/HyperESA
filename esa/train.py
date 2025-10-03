@@ -118,6 +118,7 @@ def main():
 
     parser.add_argument("--train-missing-edge", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--train-hidden", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--reconstruction", default=False, action=argparse.BooleanOptionalAction)
 
     args = parser.parse_args()
 

@@ -254,7 +254,8 @@ class Estimator(pl.LightningModule):
             
 
         self.mlp_norm = norm_fn(self.hidden_dims[0])
-
+        
+        print("set_max_items", nearest_multiple_of_8(self.set_max_items + 1))
         st_args = dict(
             num_outputs=32, # this is the k for PMA
             dim_output=self.graph_dim,
@@ -458,25 +459,25 @@ class Estimator(pl.LightningModule):
             
 
             h = self.node_edge_mlp(h)
-            h_original = h.clone()
-            num_edges, features_dim = h.shape
-            print(h.shape)
+            # h_original = h.clone()
+            # num_edges, features_dim = h.shape
+            # print(h.shape)
 
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
-            print(h.shape)
+            # print(h.shape)
 
             mask = (h != 0).all(dim=-1) # false when fill_value 
-            print(mask.shape)
+            # print(mask.shape)
             # h_reconstructed = torch.zeros(num_edges, features_dim)
-            valid_mask = mask.unsqueeze(-1)   # Flatten to a vector of size [batch_size * max_num_nodes]
-            valid_h = h * valid_mask
-            valid_h = h[valid_mask.squeeze(-1)]
+            # valid_mask = mask.unsqueeze(-1)   # Flatten to a vector of size [batch_size * max_num_nodes]
+            # valid_h = h * valid_mask
+            # valid_h = h[valid_mask.squeeze(-1)]
 
-            print(valid_h.shape, h_original.shape)
-            print(h_original)
-            print("ok now valid h")
-            print(valid_h)
-            print(F.mse_loss(h_original, valid_h))
+            # print(valid_h.shape, h_original.shape)
+            # print(h_original)
+            # print("ok now valid h")
+            # print(valid_h)
+            # print(F.mse_loss(h_original, valid_h))
 
             h_clone = h.clone()
             # print("h shape before", h.shape)
@@ -484,35 +485,49 @@ class Estimator(pl.LightningModule):
             # print("h shape AFTER", h.shape)
 
             h_missing_edges = None ; latent_rep_loss = 0.0 ; connectivity_loss = 0.0
+            l2_loss, l2_loss_hidden, l2_loss_normal = 0,0,0
             if self.train_missing_edge:
                 # target_connectivity = None
                 h_missing_edges, masked_graphs_idx, masked_edges_idx = self.mask_one_edge_per_graph(h_clone) # to modify because now dense_batched
                 h_missing_edges, enc_missing_edges = self.st_fast(h_missing_edges, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=hedge_nodes_tensor, hedge_batch_index=edge_batch_index)
 
-                
+                # print(enc_missing_edges.shape, "enc miss shape")
                 # this is wrong implementation
                 masked_pred = enc_missing_edges[masked_graphs_idx, masked_edges_idx] ; masked_target = ((enc[masked_graphs_idx, masked_edges_idx]).detach()).clone()
                 # latent_rep_loss = F.mse_loss(enc_missing_edges, enc, reduction='sum') # Compute MSE for all the edges
 
-                mean_enc = enc_missing_edges.mean(dim=1, keepdim=True)
-                dist_l2 = ((enc_missing_edges - mean_enc) ** 2).sum(dim=2).sqrt()  # [B, N]
-                l2_loss = dist_l2.mean()
+                # mean_enc = enc_missing_edges.mean(dim=1, keepdim=True)
+                # dist_l2 = ((enc_missing_edges - mean_enc) ** 2).sum(dim=2).sqrt()  # [B, N]
+                # l2_loss = dist_l2.mean()
 
-                non_masked_mask = torch.ones_like(enc_missing_edges, dtype=torch.bool)
-                non_masked_mask[masked_graphs_idx, masked_edges_idx] = False
-                non_masked_enc = enc_missing_edges[non_masked_mask]
+                # # non_masked_mask = torch.ones_like(enc_missing_edges, dtype=torch.bool)
+                # # non_masked_mask[masked_graphs_idx, masked_edges_idx] = False
+                # # non_masked_enc = enc_missing_edges[non_masked_mask]
+                # # print(non_masked_enc.shape)
 
-                mean_enc_normal = non_masked_enc.mean(dim=1, keepdim=True)
-                dist_l2_normal = ((non_masked_enc - mean_enc_normal) ** 2).sum(dim=2).sqrt()  # [B, N]
-                l2_loss_normal = dist_l2_normal.mean()
+                # mask_2d = torch.ones((enc_missing_edges.shape[0], enc_missing_edges.shape[1]), dtype=torch.bool, device=enc_missing_edges.device)
+                # mask_2d[masked_graphs_idx, masked_edges_idx] = False  # False = masked
+                # # Step 2: Expand to 3D to match shape of enc_missing_edges
+                # mask_3d = mask_2d.unsqueeze(-1).expand_as(enc_missing_edges)  # shape [32, 64, 256]
+                # non_masked_enc = enc_missing_edges.clone()
+                # non_masked_enc[~mask_3d] = 0.0  # Zero out masked entries
 
-                mean_enc_hidden = masked_pred.mean(dim=1, keepdim=True)
-                dist_l2_hidden = ((masked_pred - mean_enc_hidden) ** 2).sum(dim=2).sqrt()  # [B, N]
-                l2_loss_hidden = dist_l2_hidden.mean()
+                # # non_masked_mask = torch.ones_like(enc_missing_edges, dtype=torch.bool)
+                # # non_masked_mask[masked_graphs_idx, masked_edges_idx] = False
+                # # non_masked_enc = enc_missing_edges[non_masked_mask]
+                # # print(non_masked_enc.shape)
+
+                # mean_enc_normal = non_masked_enc.mean(dim=1, keepdim=True) # bit skewed by wieght of 0 still in N
+                # dist_l2_normal = ((non_masked_enc - mean_enc_normal) ** 2).sum(dim=2).sqrt()  # [B, N]
+                # l2_loss_normal = dist_l2_normal.mean()
+
+                # mean_enc_hidden = masked_pred.mean(dim=1, keepdim=True)
+                # dist_l2_hidden = ((masked_pred - mean_enc_hidden) ** 2).sum(dim=2).sqrt()  # [B, N]
+                # l2_loss_hidden = dist_l2_hidden.mean()
 
 
 
-                latent_rep_loss = F.mse_loss(masked_pred, masked_target, reduction='sum') # Compute MSE only for the masked edges
+                latent_rep_loss = F.mse_loss(masked_pred, masked_target, reduction='mean') # Compute MSE only for the masked edges
                 # latent_rep_loss = 0.0
                 #latent_rep_loss = (F.mse_loss(h_missing_edges, h, reduction='none')).sum()  #.mean()
                 
@@ -557,7 +572,7 @@ class Estimator(pl.LightningModule):
         }
 
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt, mode=mode, factor=0.5, patience=self.early_stopping_patience // 2, verbose=True
+                opt, mode=mode, factor=0.5, patience=1, verbose=True # self.early_stopping_patience // 2
         )
         if self.monitor_loss_name != "train_loss":
             opt_dict["lr_scheduler"] = sched
@@ -664,7 +679,7 @@ class Estimator(pl.LightningModule):
         task_loss, per_target_losses, latent_rep_loss, predictions, y, l2_loss, l2_loss_normal, l2_loss_hidden = self._batch_loss(
             x, edge_index, y, batch_mapping, edge_attr=edge_attr, num_max_items=num_max_items, step_type=step_type, batch=batch
         )
-        latent_rep_loss = latent_rep_loss * 0.01  #100000
+        latent_rep_loss = latent_rep_loss  #100000
         # --- Logging the individual losses for regression ---
         if self.task_type == "regression" and self.linear_output_size > 1:
             for idx, target_name in enumerate(self.target_names):
@@ -833,6 +848,7 @@ class Estimator(pl.LightningModule):
             
             else:
                 metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
+                print("there")
                 self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
                 self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
                 self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
