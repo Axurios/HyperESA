@@ -255,7 +255,7 @@ class Estimator(pl.LightningModule):
 
         self.mlp_norm = norm_fn(self.hidden_dims[0])
         
-        print("set_max_items", nearest_multiple_of_8(self.set_max_items + 1))
+        # print("set_max_items", nearest_multiple_of_8(self.set_max_items + 1))
         st_args = dict(
             num_outputs=32, # this is the k for PMA
             dim_output=self.graph_dim,
@@ -544,13 +544,17 @@ class Estimator(pl.LightningModule):
         predictions = predictions.detach().squeeze()
 
         if self.task_type == "regression":
-            output = (predictions.cpu(), y.cpu())
+            output = (predictions.detach().cpu(), y.detach().cpu())
         elif "classification" in self.task_type:
-            output = (predictions.cpu(), y.cpu())
+            output = (predictions.detach().cpu(), y.detach().cpu())
+
+    
+
 
         if step_type == "train":
             self.train_output[self.current_epoch].append(output)
         elif step_type == "validation":
+            # print(f"Validation output size: {len(self.val_output[self.current_epoch])}")
             self.val_output[self.current_epoch].append(output)
         elif step_type == "validation_test":
             self.val_test_output[self.current_epoch].append(output)
@@ -571,14 +575,14 @@ class Estimator(pl.LightningModule):
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int, dataloader_idx: int = 0):
         if dataloader_idx == 0:
-            val_total_loss, latent_rep_loss = self._step(batch, "validation")
+            val_total_loss = self._step(batch, "validation")
 
             self.log("val_loss", val_total_loss)
 
             return val_total_loss
 
         if dataloader_idx == 1:
-            val_test_total_loss, latent_rep_loss = self._step(batch, "validation_test")
+            val_test_total_loss = self._step(batch, "validation_test")
 
             self.log("val_test_loss", val_test_total_loss)
 
@@ -586,7 +590,7 @@ class Estimator(pl.LightningModule):
 
 
     def test_step(self, batch: torch.Tensor, batch_idx: int):
-        test_total_loss, latent_rep_loss = self._step(batch, "test")
+        test_total_loss = self._step(batch, "test")
 
         self.log("test_loss", test_total_loss)
 
@@ -664,7 +668,7 @@ class Estimator(pl.LightningModule):
             
             else:
                 metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
-                print("there")
+                # print("there")
                 self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
                 self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
                 self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
@@ -703,6 +707,8 @@ class Estimator(pl.LightningModule):
             del y_true
             del self.val_test_output[self.current_epoch]
 
+        torch.cuda.empty_cache()
+
 
     def on_test_epoch_end(self):
         test_outputs_per_epoch = self.test_output[self.num_called_test]
@@ -713,6 +719,7 @@ class Estimator(pl.LightningModule):
         self.test_true[self.num_called_test] = y_true
 
         self.num_called_test += 1
+        
 
 
 

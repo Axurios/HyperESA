@@ -1,14 +1,31 @@
 import torch
 import admin_torch
-
+import math
 from torch import nn
 from torch.nn import functional as F
 from torch_geometric.utils import unbatch_edge_index
 
 from utils.norm_layers import BN, LN
-from mos.mha import SAB, PMA
+from mos.mha import SAB, PMA, S_2Simp_AB, S_3Simp_AB
 from mos.mlp_utils import SmallMLP, GatedMLPMulti
 
+
+def parse_layers(tokens, i=0):
+    result = []
+    while i < len(tokens):
+        tok = tokens[i]
+
+        if tok == "R":  # router starts: expect '['
+            assert tokens[i+1] == "[", f"Expected '[', got {tokens[i+1]}"
+            inner, j = parse_layers(tokens, i+2)  # parse inside router
+            result.append({"R": inner})
+            i = j
+        elif tok == "]":  # router end
+            return result, i + 1
+        else:
+            result.append(tok)
+            i += 1
+    return result
 
 def get_adj_mask_from_edge_index_node(
     edge_index, batch_size, max_items, batch_mapping, xformers_or_torch_attn, use_bfloat16=True, device="cuda:0"
@@ -240,7 +257,7 @@ def get_adj_mask_from_edge_index_edge(
 
     if xformers_or_torch_attn in ["torch"]:
         adj_mask = ~adj_mask
-    
+     
     adj_mask = adj_mask.unsqueeze(1)
     return adj_mask
 
@@ -290,9 +307,19 @@ class SABComplete(nn.Module):
 
         if dim_in != dim_out:
             self.proj_1 = nn.Linear(dim_in, dim_out)
-    
-        # print("ok3")
-        self.sab = SAB(dim_in, dim_out, num_heads, dropout, xformers_or_torch_attn)
+        
+        if self.idx == 0 or self.idx == 1:
+            self.sab = SAB(dim_in, dim_out, num_heads, dropout, xformers_or_torch_attn)
+
+
+        if self.idx == 3:
+            print("2-simplicial attention layer")
+            self.sab = S_2Simp_AB(dim_in, dim_out, num_heads, dropout, xformers_or_torch_attn)
+
+        if self.idx == 4:
+            print("3-simplicial attention layer")
+            self.sab = S_3Simp_AB(dim_in, dim_out, num_heads, dropout, xformers_or_torch_attn)
+
 
         if self.idx != 2:
             bn_dim = self.set_max_items
@@ -497,6 +524,189 @@ class PMAComplete(nn.Module):
         return out, edge_index, batch_mapping, max_items, adj_mask
 
 
+
+
+
+
+
+
+
+
+
+
+class Router(nn.Module):
+    def __init__(
+        self,
+        layers_inside,
+        dim_in,
+        dim_out,
+        num_heads,
+        dropout,
+        idx,
+        norm_type,
+        use_mlp=False,
+        mlp_hidden_size=64,
+        mlp_type="standard",
+        node_or_edge="edge",
+        xformers_or_torch_attn="xformers",
+        residual_dropout=0,
+        set_max_items=0,
+        use_bfloat16=True,
+        num_mlp_layers=3,
+        pre_or_post="pre",
+        num_layers_for_residual=0,
+        use_mlp_ln=False,
+        mlp_dropout=0,
+        activation="sigmoid",
+        beta=0.2,
+        sab_dropout=0,
+        mab_dropout=0,
+    ):
+        super(Router, self).__init__()
+
+        self.beta = beta
+        # want seq_len to get k, want k to get 
+
+        # self.dim_in = dim_in ; self.dim_out = dim_out
+        self.linear = nn.Linear(dim_in, 1, bias=False)
+        self.activation = activation
+
+        self.layers_in = layers_inside
+        print(layers_inside)
+        
+        self.router_seq = []
+        # need new set_max_items,
+        # print(set_max_items)
+        self.k = set_max_items # if just attention
+        # self.k_beta = int(self.beta * set_max_items)  # number of tokens to keep per sequence
+        # self.k = int(set_max_items ** (2/3))
+        # self.k3 = int(set_max_items ** 0.5)
+        # print(self.k, "nbr of tokens left k")
+        # print(self.k_beta, "k beta")
+        # print(self.k3, "k3")
+
+
+        for lt in self.layers_in:
+            if lt in ["S", "M", "M2", "M3"]:
+                if lt == "S":
+                    idx = 0
+                if lt == "M":
+                    idx = 1
+                if lt == "M2":
+                    self.k = int(set_max_items ** (2/3))+1
+                    print(self.k, "nbr of tokens left k")
+                    idx = 3
+                if lt == "M3":
+                    self.k = int(set_max_items ** 0.5)+1
+                    print(self.k, "nbr of tokens left k")
+                    idx = 4
+                # idx = 0 if lt == "S" else 1
+
+                self.router_seq.append(
+                    SABComplete(  
+                        dim_in,
+                        dim_out,
+                        num_heads,
+                        idx=idx,
+                        dropout=dropout,
+                        node_or_edge=node_or_edge,
+                        xformers_or_torch_attn=xformers_or_torch_attn,
+                        pre_or_post=pre_or_post,
+                        residual_dropout=residual_dropout,
+                        use_mlp=use_mlp,
+                        mlp_hidden_size=mlp_hidden_size,
+                        mlp_dropout=mlp_dropout,
+                        num_mlp_layers=num_mlp_layers,
+                        use_mlp_ln=use_mlp_ln,
+                        norm_type=norm_type,
+                        mlp_type=mlp_type,
+                        set_max_items=self.k,
+                        use_bfloat16=use_bfloat16,
+                        num_layers_for_residual=num_layers_for_residual,
+                    )
+                )
+                print(f"Added encoder {lt} ", f"({dim_in}, {dim_out}, {num_heads})")
+                
+
+            if isinstance(lt, dict) and "R" in lt:
+                # print("found a dict", lt)
+                idx = 0 if lt == "S" else 1
+                dropout_val = sab_dropout if lt == "S" else mab_dropout
+                self.router_seq.append(
+                    Router(
+                        lt['R'],
+                        dim_in,
+                        dim_out,
+                        num_heads,
+                        idx=idx,
+                        dropout=dropout_val,
+                        node_or_edge=node_or_edge,
+                        xformers_or_torch_attn=xformers_or_torch_attn,
+                        pre_or_post=pre_or_post,
+                        residual_dropout=residual_dropout,
+                        use_mlp=use_mlp,
+                        mlp_hidden_size=mlp_hidden_size,
+                        mlp_dropout=mlp_dropout,
+                        num_mlp_layers=num_mlp_layers,
+                        use_mlp_ln=use_mlp_ln,
+                        norm_type=norm_type,
+                        mlp_type=mlp_type,
+                        set_max_items=self.k,
+                        use_bfloat16=use_bfloat16,
+                        num_layers_for_residual=num_layers_for_residual,
+                    )
+                )
+                print(f"Added router ({dim_in}, {dim_out}, {num_heads}) with {lt['R']} inside")
+        self.router_seq = nn.Sequential(*self.router_seq)
+                
+
+    def forward(self, inp):
+        # print("in router forward")
+        X, edge_index, batch_mapping, max_items, adj_mask = inp
+
+        scores = self.linear(X).squeeze(-1)  # [batch, seq_len]
+        
+        if self.activation == "sigmoid":
+            scores = torch.sigmoid(scores)
+        elif self.activation == "tanh":
+            scores = torch.tanh(scores)
+        else:
+            raise NotImplementedError
+        
+        batch_size, seq_len, hidden_dim = X.shape
+
+        X_clone = X.clone()
+
+        topk_scores, topk_indices = torch.topk(scores, self.k, dim=1)  # [batch, k] # top-k indices along seq_len dimension for each batch
+        X_topk = torch.gather(
+            X, 1, topk_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
+        )  # [batch, k, hidden_dim]
+        # print(X_topk.shape)
+
+        enc_Xtopk, _, _, _, _ = self.router_seq((X_topk, edge_index, batch_mapping, self.k, None)) # this updates X_topk
+        # X_topk, edge_index, batch_mapping, max_items, adj_mask = self.router_seq((X_topk, edge_index, batch_mapping, max_items, adj_mask))
+
+        topk_scores_reshaped = topk_scores.unsqueeze(-1)  # [batch, k, 1]
+        X_topk_weighted = enc_Xtopk * topk_scores_reshaped
+
+        out = X_clone.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, hidden_dim), X_topk_weighted)  # print(X.shape)
+        return out, edge_index, batch_mapping, max_items, adj_mask
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class ESA(nn.Module):
     def __init__(
         self,
@@ -525,7 +735,8 @@ class ESA(nn.Module):
     ):
         super(ESA, self).__init__()
 
-        assert len(layer_types) == len(dim_hidden) and len(layer_types) == len(num_heads)
+        
+        
 
         self.dim_hidden = dim_hidden
         self.num_heads = num_heads
@@ -549,15 +760,18 @@ class ESA(nn.Module):
         self.use_bfloat16 = use_bfloat16
         
         layer_tracker = 0
-
+        # print(self.layer_types)
+        self.layer_parsed = parse_layers(self.layer_types)
+        print(self.layer_parsed)
+        assert len(self.layer_parsed) == len(dim_hidden) and len(self.layer_parsed) == len(num_heads)
         self.encoder = []
 
         pma_encountered = False
         dim_pma = -1
 
-        has_pma = "P" in self.layer_types
+        has_pma = "P" in self.layer_parsed
 
-        for lt in self.layer_types:
+        for lt in self.layer_parsed:
             layer_in_dim = dim_hidden[layer_tracker]
             layer_num_heads = num_heads[layer_tracker]
             if lt != "P":
@@ -567,15 +781,18 @@ class ESA(nn.Module):
                     layer_out_dim = dim_hidden[layer_tracker]
             else:
                 layer_out_dim = -1
+            
+            if lt in ["S", "M"] and not pma_encountered:
+                idx = 0 if lt == "S" else 1
+                dropout_val = sab_dropout if lt == "S" else mab_dropout
 
-            if lt == "S" and not pma_encountered:
                 self.encoder.append(
                     SABComplete(
                         layer_in_dim,
                         layer_out_dim,
                         layer_num_heads,
-                        idx=0,
-                        dropout=sab_dropout,
+                        idx=idx,
+                        dropout=dropout_val,
                         node_or_edge=node_or_edge,
                         xformers_or_torch_attn=xformers_or_torch_attn,
                         pre_or_post=pre_or_post,
@@ -592,17 +809,22 @@ class ESA(nn.Module):
                         num_layers_for_residual=len(dim_hidden) * 2,
                     )
                 )
+                print(f"Added encoder {'SAB' if lt == 'S' else 'MAB'} ", f"({layer_in_dim}, {layer_out_dim}, {layer_num_heads})")
                 
-                print(f"Added encoder SAB ({layer_in_dim}, {layer_out_dim}, {layer_num_heads})")
 
-            if lt == "M" and not pma_encountered:
+            if isinstance(lt, dict) and "R" in lt:
+                # print("found a dict", lt)
+                # idx = 0 if lt == "S" else 1
+                # dropout_val = sab_dropout if lt == "S" else mab_dropout
+
                 self.encoder.append(
-                    SABComplete(
+                    Router(
+                        lt['R'],
                         layer_in_dim,
                         layer_out_dim,
                         layer_num_heads,
-                        idx=1,
-                        dropout=mab_dropout,
+                        idx=idx,
+                        dropout=dropout_val,
                         node_or_edge=node_or_edge,
                         xformers_or_torch_attn=xformers_or_torch_attn,
                         pre_or_post=pre_or_post,
@@ -617,10 +839,11 @@ class ESA(nn.Module):
                         set_max_items=set_max_items,
                         use_bfloat16=use_bfloat16,
                         num_layers_for_residual=len(dim_hidden) * 2,
+                        sab_dropout = sab_dropout,
+                        mab_dropout= mab_dropout,
                     )
                 )
-                
-                print(f"Added encoder MAB ({layer_in_dim}, {layer_out_dim}, {layer_num_heads})")
+                print(f"Added Router ({layer_in_dim}, {layer_out_dim}, {layer_num_heads}) with {lt['R']} inside")
                 
             if lt == "P":
                 pma_encountered = True
@@ -673,12 +896,12 @@ class ESA(nn.Module):
                         num_layers_for_residual=len(dim_hidden) * 2,
                     )
                 )
-
                 print(f"Added decoder SAB ({layer_in_dim}, {layer_out_dim}, {layer_num_heads})")
 
             if lt != "P":
                 layer_tracker += 1
-
+            
+            
         self.encoder = nn.Sequential(*self.encoder)
         if pma_encountered:
             self.decoder = nn.Sequential(*self.decoder)
@@ -719,7 +942,13 @@ class ESA(nn.Module):
         # batch_mapping links node with graphs, so not an issue
         # the true issue is edge_index which is only edges, not hyperedges
         # print("okok")
-        enc, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask))
+        # enc, _, _, _, _ = self.encoder((X, edge_index, batch_mapping, num_max_items, adj_mask))
+        enc = X.clone()
+        for layer_idx in range(len(self.encoder)):
+            layer = self.encoder[layer_idx]  # get the layer from nn.Sequential
+            # if layer is a router, then do smthing to keep the x, etc.
+            enc, _, _,  _, _ = layer((enc, edge_index, batch_mapping, num_max_items, adj_mask))  # forward pass through the layer
+
         if hasattr(self, "dim_pma") and self.dim_hidden[0] != self.dim_pma:
             X = self.out_proj(X)
 
