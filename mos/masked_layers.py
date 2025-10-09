@@ -584,7 +584,10 @@ class Router(nn.Module):
         # print(self.k, "nbr of tokens left k")
         # print(self.k_beta, "k beta")
         # print(self.k3, "k3")
-
+        if "M2" in self.layers_in:
+            self.k = self.k = int(set_max_items ** (2/3))+1
+        if "M3" in self.layers_in:
+            self.k = int(set_max_items ** 0.5)+1
 
         for lt in self.layers_in:
             if lt in ["S", "M", "M2", "M3"]:
@@ -593,11 +596,10 @@ class Router(nn.Module):
                 if lt == "M":
                     idx = 1
                 if lt == "M2":
-                    self.k = int(set_max_items ** (2/3))+1
                     print(self.k, "nbr of tokens left k")
                     idx = 3
                 if lt == "M3":
-                    self.k = int(set_max_items ** 0.5)+1
+                    # self.k = int(set_max_items ** 0.5)+1
                     print(self.k, "nbr of tokens left k")
                     idx = 4
                 # idx = 0 if lt == "S" else 1

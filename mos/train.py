@@ -394,6 +394,10 @@ def main():
         np.save(true_path, model.test_true)
         np.save(metrics_path, model.test_metrics)
 
+        # import os
+        # Disable symlink creation for WandB
+        os.environ["WANDB_DISABLE_SYMLINKS"] = "true"
+
         wandb.save(preds_path)
         wandb.save(true_path)
         wandb.save(metrics_path)
