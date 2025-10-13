@@ -553,13 +553,18 @@ class Estimator(pl.LightningModule):
 
         if step_type == "train":
             self.train_output[self.current_epoch].append(output)
+            # if self.num_called_test > 0:
+                # print(f"Train output size: {output[0].shape}, {output[1].shape}")
         elif step_type == "validation":
             # print(f"Validation output size: {len(self.val_output[self.current_epoch])}")
             self.val_output[self.current_epoch].append(output)
+            # print(f"Validation output size: {output[0].shape}, {output[1].shape}")
         elif step_type == "validation_test":
             self.val_test_output[self.current_epoch].append(output)
-        elif step_type == "test":
+            # print(f"Validation_test output size: {output[0].shape}, {output[1].shape}")
+        elif step_type == "test":   
             self.test_output[self.num_called_test].append(output)
+            # print(f"Test output size: {output}")
         
         return task_loss
 
@@ -604,7 +609,7 @@ class Estimator(pl.LightningModule):
         y_true = torch.cat([item[1] for item in epoch_outputs], dim=0)
 
         # y_pred and y_true should now have shape [total_samples, linear_output_size]
-        
+        print(f"{epoch_type} - y_pred shape: {y_pred.shape}, y_true shape: {y_true.shape}")
         # We need to make sure the scaler logic is also using the right shape
         if self.scaler:
             if self.linear_output_size > 1:
@@ -672,6 +677,7 @@ class Estimator(pl.LightningModule):
                 self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
                 self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
                 self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
+                print(f"{epoch_type} RMSE", metrics["RMSE"])
                 self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
         
         return metrics, y_pred, y_true
