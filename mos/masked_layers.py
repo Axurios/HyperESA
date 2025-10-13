@@ -703,6 +703,175 @@ class Router(nn.Module):
 
 
 
+class RecursiveRouter(nn.Module):
+    def __init__(
+        self,
+        layers_inside,
+        dim_in,
+        dim_out,
+        num_heads,
+        dropout,
+        idx,
+        norm_type,
+        use_mlp=False,
+        mlp_hidden_size=64,
+        mlp_type="standard",
+        node_or_edge="edge",
+        xformers_or_torch_attn="xformers",
+        residual_dropout=0,
+        set_max_items=0,
+        use_bfloat16=True,
+        num_mlp_layers=3,
+        pre_or_post="pre",
+        num_layers_for_residual=0,
+        use_mlp_ln=False,
+        mlp_dropout=0,
+        activation="sigmoid",
+        beta=0.2,
+        sab_dropout=0,
+        mab_dropout=0,
+    ):
+        super(Router, self).__init__()
+
+        self.beta = beta
+        # self.dim_in = dim_in ; self.dim_out = dim_out
+        self.linear = nn.Linear(dim_in, 1, bias=False)
+        self.activation = activation
+
+        self.layers_in = layers_inside
+        print(layers_inside)
+        
+        self.router_seq = []
+        self.k = set_max_items # if just attention
+        if "M2" in self.layers_in:
+            self.k = self.k = int(set_max_items ** (2/3))+1
+        if "M3" in self.layers_in:
+            self.k = int(set_max_items ** 0.5)+1
+
+        for lt in self.layers_in:
+            if lt in ["S", "M", "M2", "M3"]:
+                if lt == "S": 
+                    idx = 0
+                if lt == "M":
+                    idx = 1
+                if lt == "M2":
+                    print(self.k, "nbr of tokens left k")
+                    idx = 3
+                if lt == "M3":
+                    # self.k = int(set_max_items ** 0.5)+1
+                    print(self.k, "nbr of tokens left k")
+                    idx = 4
+                # idx = 0 if lt == "S" else 1
+
+                self.router_seq.append(
+                    SABComplete(  
+                        dim_in,
+                        dim_out,
+                        num_heads,
+                        idx=idx,
+                        dropout=dropout,
+                        node_or_edge=node_or_edge,
+                        xformers_or_torch_attn=xformers_or_torch_attn,
+                        pre_or_post=pre_or_post,
+                        residual_dropout=residual_dropout,
+                        use_mlp=use_mlp,
+                        mlp_hidden_size=mlp_hidden_size,
+                        mlp_dropout=mlp_dropout,
+                        num_mlp_layers=num_mlp_layers,
+                        use_mlp_ln=use_mlp_ln,
+                        norm_type=norm_type,
+                        mlp_type=mlp_type,
+                        set_max_items=self.k,
+                        use_bfloat16=use_bfloat16,
+                        num_layers_for_residual=num_layers_for_residual,
+                    )
+                )
+                print(f"Added encoder {lt} ", f"({dim_in}, {dim_out}, {num_heads})")
+                
+
+            if isinstance(lt, dict) and "R" in lt:
+                # print("found a dict", lt)
+                idx = 0 if lt == "S" else 1
+                dropout_val = sab_dropout if lt == "S" else mab_dropout
+                self.router_seq.append(
+                    Router(
+                        lt['R'],
+                        dim_in,
+                        dim_out,
+                        num_heads,
+                        idx=idx,
+                        dropout=dropout_val,
+                        node_or_edge=node_or_edge,
+                        xformers_or_torch_attn=xformers_or_torch_attn,
+                        pre_or_post=pre_or_post,
+                        residual_dropout=residual_dropout,
+                        use_mlp=use_mlp,
+                        mlp_hidden_size=mlp_hidden_size,
+                        mlp_dropout=mlp_dropout,
+                        num_mlp_layers=num_mlp_layers,
+                        use_mlp_ln=use_mlp_ln,
+                        norm_type=norm_type,
+                        mlp_type=mlp_type,
+                        set_max_items=self.k,
+                        use_bfloat16=use_bfloat16,
+                        num_layers_for_residual=num_layers_for_residual,
+                    )
+                )
+                print(f"Added router ({dim_in}, {dim_out}, {num_heads}) with {lt['R']} inside")
+        self.router_seq = nn.Sequential(*self.router_seq)
+                
+
+    def forward(self, inp):
+        # print("in router forward")
+        X, edge_index, batch_mapping, max_items, adj_mask = inp
+
+        scores = self.linear(X).squeeze(-1)  # [batch, seq_len]
+        
+        if self.activation == "sigmoid":
+            scores = torch.sigmoid(scores)
+        elif self.activation == "tanh":
+            scores = torch.tanh(scores)
+        else:
+            raise NotImplementedError
+        
+        batch_size, seq_len, hidden_dim = X.shape
+
+        X_clone = X.clone()
+
+        topk_scores, topk_indices = torch.topk(scores, self.k, dim=1)  # [batch, k] # top-k indices along seq_len dimension for each batch
+        X_topk = torch.gather(
+            X, 1, topk_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
+        )  # [batch, k, hidden_dim]
+        # print(X_topk.shape)
+
+        enc_Xtopk, _, _, _, _ = self.router_seq((X_topk, edge_index, batch_mapping, self.k, None)) # this updates X_topk
+        # X_topk, edge_index, batch_mapping, max_items, adj_mask = self.router_seq((X_topk, edge_index, batch_mapping, max_items, adj_mask))
+
+        topk_scores_reshaped = topk_scores.unsqueeze(-1)  # [batch, k, 1]
+        X_topk_weighted = enc_Xtopk * topk_scores_reshaped
+
+        out = X_clone.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, hidden_dim), X_topk_weighted)  # print(X.shape)
+        return out, edge_index, batch_mapping, max_items, adj_mask
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

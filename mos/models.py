@@ -581,14 +581,12 @@ class Estimator(pl.LightningModule):
     def validation_step(self, batch: torch.Tensor, batch_idx: int, dataloader_idx: int = 0):
         if dataloader_idx == 0:
             val_total_loss = self._step(batch, "validation")
-
             self.log("val_loss", val_total_loss)
 
             return val_total_loss
 
         if dataloader_idx == 1:
             val_test_total_loss = self._step(batch, "validation_test")
-
             self.log("val_test_loss", val_test_total_loss)
 
             return val_test_total_loss
@@ -596,7 +594,6 @@ class Estimator(pl.LightningModule):
 
     def test_step(self, batch: torch.Tensor, batch_idx: int):
         test_total_loss = self._step(batch, "test")
-
         self.log("test_loss", test_total_loss)
 
         return test_total_loss
@@ -609,8 +606,11 @@ class Estimator(pl.LightningModule):
         y_true = torch.cat([item[1] for item in epoch_outputs], dim=0)
 
         # y_pred and y_true should now have shape [total_samples, linear_output_size]
-        print(f"{epoch_type} - y_pred shape: {y_pred.shape}, y_true shape: {y_true.shape}")
+        # print(f"{epoch_type} - y_pred shape: {y_pred.shape}, y_true shape: {y_true.shape}")
         # We need to make sure the scaler logic is also using the right shape
+        # print("Y_PRED MEAN BEFORE INVERSE:", y_pred.mean().item())
+        # print("Y_TRUE MEAN BEFORE INVERSE:", y_true.mean().item())
+
         if self.scaler:
             if self.linear_output_size > 1:
                 y_pred = self.scaler.inverse_transform(y_pred.cpu().reshape(-1, self.linear_output_size))
@@ -621,6 +621,10 @@ class Estimator(pl.LightningModule):
             
             y_pred = torch.from_numpy(y_pred).to(self.device)
             y_true = torch.from_numpy(y_true).to(self.device)
+
+        # print("Y_PRED MEAN AFTER INVERSE:", y_pred.mean().item())
+        # print("Y_TRUE MEAN AFTER INVERSE:", y_true.mean().item())
+
 
         # Now, the rest of the logic can operate on correctly shaped tensors
         if self.task_type == "binary_classification" and self.linear_output_size > 1:
@@ -674,6 +678,7 @@ class Estimator(pl.LightningModule):
             else:
                 metrics = get_regr_metrics_pt(y_true.squeeze(), y_pred.squeeze())
                 # print("there")
+                # print(y_true.head(), y_pred.head(), print(metrics.head()))
                 self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
                 self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
                 self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
