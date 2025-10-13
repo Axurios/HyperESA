@@ -10,22 +10,44 @@ from mos.mha import SAB, PMA, S_2Simp_AB, S_3Simp_AB
 from mos.mlp_utils import SmallMLP, GatedMLPMulti
 
 
+# def parse_layers(tokens, i=0):
+#     result = []
+#     while i < len(tokens):
+#         tok = tokens[i]
+
+#         if tok == "R":  # router starts: expect '['
+#             assert tokens[i+1] == "[", f"Expected '[', got {tokens[i+1]}"
+#             inner, j = parse_layers(tokens, i+2)  # parse inside router
+#             result.append({"R": inner})
+#             i = j
+#         elif tok == "]":  # router end
+#             return result, i + 1
+#         else:
+#             result.append(tok)
+#             i += 1
+#     return result
 def parse_layers(tokens, i=0):
     result = []
     while i < len(tokens):
         tok = tokens[i]
-
-        if tok == "R":  # router starts: expect '['
-            assert tokens[i+1] == "[", f"Expected '[', got {tokens[i+1]}"
-            inner, j = parse_layers(tokens, i+2)  # parse inside router
-            result.append({"R": inner})
+        if tok == "R" or tok == "L":  # Either router or layer starts: expect '['
+            assert tokens[i + 1] == "[", f"Expected '[', got {tokens[i + 1]}"
+            inner, j = parse_layers(tokens, i + 2)  # parse inside the router or layer
+            
+            if tok == "R":
+                result.append({"R": inner})  # Add router
+            elif tok == "L":
+                result.append({"L": inner})  # Add layer
             i = j
-        elif tok == "]":  # router end
+            
+        elif tok == "]":  # Router or Layer end
             return result, i + 1
         else:
-            result.append(tok)
-            i += 1
+            result.append(tok) ; i += 1
     return result
+
+
+
 
 def get_adj_mask_from_edge_index_node(
     edge_index, batch_size, max_items, batch_mapping, xformers_or_torch_attn, use_bfloat16=True, device="cuda:0"
@@ -730,23 +752,21 @@ class RecursiveRouter(nn.Module):
         beta=0.2,
         sab_dropout=0,
         mab_dropout=0,
+        recursive_depth=3,
     ):
-        super(Router, self).__init__()
+        super(RecursiveRouter, self).__init__()
 
         self.beta = beta
         # self.dim_in = dim_in ; self.dim_out = dim_out
+        self.recursive_depth = recursive_depth
         self.linear = nn.Linear(dim_in, 1, bias=False)
         self.activation = activation
 
         self.layers_in = layers_inside
-        print(layers_inside)
+        # print(layers_inside)
         
         self.router_seq = []
         self.k = set_max_items # if just attention
-        if "M2" in self.layers_in:
-            self.k = self.k = int(set_max_items ** (2/3))+1
-        if "M3" in self.layers_in:
-            self.k = int(set_max_items ** 0.5)+1
 
         for lt in self.layers_in:
             if lt in ["S", "M", "M2", "M3"]:
@@ -786,45 +806,12 @@ class RecursiveRouter(nn.Module):
                         num_layers_for_residual=num_layers_for_residual,
                     )
                 )
-                print(f"Added encoder {lt} ", f"({dim_in}, {dim_out}, {num_heads})")
-                
-
-            if isinstance(lt, dict) and "R" in lt:
-                # print("found a dict", lt)
-                idx = 0 if lt == "S" else 1
-                dropout_val = sab_dropout if lt == "S" else mab_dropout
-                self.router_seq.append(
-                    Router(
-                        lt['R'],
-                        dim_in,
-                        dim_out,
-                        num_heads,
-                        idx=idx,
-                        dropout=dropout_val,
-                        node_or_edge=node_or_edge,
-                        xformers_or_torch_attn=xformers_or_torch_attn,
-                        pre_or_post=pre_or_post,
-                        residual_dropout=residual_dropout,
-                        use_mlp=use_mlp,
-                        mlp_hidden_size=mlp_hidden_size,
-                        mlp_dropout=mlp_dropout,
-                        num_mlp_layers=num_mlp_layers,
-                        use_mlp_ln=use_mlp_ln,
-                        norm_type=norm_type,
-                        mlp_type=mlp_type,
-                        set_max_items=self.k,
-                        use_bfloat16=use_bfloat16,
-                        num_layers_for_residual=num_layers_for_residual,
-                    )
-                )
-                print(f"Added router ({dim_in}, {dim_out}, {num_heads}) with {lt['R']} inside")
+                print(f"Added recursive encoder {lt} ", f"({dim_in}, {dim_out}, {num_heads})")
         self.router_seq = nn.Sequential(*self.router_seq)
                 
 
     def forward(self, inp):
-        # print("in router forward")
         X, edge_index, batch_mapping, max_items, adj_mask = inp
-
         scores = self.linear(X).squeeze(-1)  # [batch, seq_len]
         
         if self.activation == "sigmoid":
@@ -835,23 +822,44 @@ class RecursiveRouter(nn.Module):
             raise NotImplementedError
         
         batch_size, seq_len, hidden_dim = X.shape
-
         X_clone = X.clone()
 
         topk_scores, topk_indices = torch.topk(scores, self.k, dim=1)  # [batch, k] # top-k indices along seq_len dimension for each batch
         X_topk = torch.gather(
             X, 1, topk_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
         )  # [batch, k, hidden_dim]
-        # print(X_topk.shape)
 
-        enc_Xtopk, _, _, _, _ = self.router_seq((X_topk, edge_index, batch_mapping, self.k, None)) # this updates X_topk
-        # X_topk, edge_index, batch_mapping, max_items, adj_mask = self.router_seq((X_topk, edge_index, batch_mapping, max_items, adj_mask))
 
+        for depth in range(self.recursive_depth):
+            print(f"Processing recursive depth {depth + 1} of {self.recursive_depth}")
+            # Pass selected tokens through the corresponding router layer
+            enc_Xtopk, _, _, _, _ = self.router_seq((X_topk, edge_index, batch_mapping, self.k, None))
+
+            # Shrink the number of selected tokens by half each time
+            next_k = self.k // 2 if self.k > 1 else 1  # a bit arbitrary check MoR
+
+            # Update X_topk with the new selected tokens
+            topk_scores, topk_indices = torch.topk(scores, self.k, dim=1)
+            X_topk = torch.gather(
+                X, 1, topk_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
+            )  # [batch, next_k, hidden_dim]
+
+        # After all recursive layers, gather the final output
         topk_scores_reshaped = topk_scores.unsqueeze(-1)  # [batch, k, 1]
         X_topk_weighted = enc_Xtopk * topk_scores_reshaped
 
-        out = X_clone.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, hidden_dim), X_topk_weighted)  # print(X.shape)
+        out = X_clone.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, hidden_dim), X_topk_weighted)
         return out, edge_index, batch_mapping, max_items, adj_mask
+    
+
+        # enc_Xtopk, _, _, _, _ = self.router_seq((X_topk, edge_index, batch_mapping, self.k, None)) # this updates X_topk
+        # # X_topk, edge_index, batch_mapping, max_items, adj_mask = self.router_seq((X_topk, edge_index, batch_mapping, max_items, adj_mask))
+
+        # topk_scores_reshaped = topk_scores.unsqueeze(-1)  # [batch, k, 1]
+        # X_topk_weighted = enc_Xtopk * topk_scores_reshaped
+
+        # out = X_clone.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, hidden_dim), X_topk_weighted)  # print(X.shape)
+        # return out, edge_index, batch_mapping, max_items, adj_mask
 
 
 
@@ -1015,6 +1023,37 @@ class ESA(nn.Module):
                     )
                 )
                 print(f"Added Router ({layer_in_dim}, {layer_out_dim}, {layer_num_heads}) with {lt['R']} inside")
+            
+            if isinstance(lt, dict) and "L" in lt:
+                # how to put max recursive depth in hyperparameters ?
+                self.encoder.append(
+                    RecursiveRouter(
+                        lt['L'],
+                        layer_in_dim,
+                        layer_out_dim,
+                        layer_num_heads,
+                        idx=idx,
+                        dropout=dropout_val,
+                        node_or_edge=node_or_edge,
+                        xformers_or_torch_attn=xformers_or_torch_attn,
+                        pre_or_post=pre_or_post,
+                        residual_dropout=residual_dropout,
+                        use_mlp=use_mlps,
+                        mlp_hidden_size=mlp_hidden_size,
+                        mlp_dropout=mlp_dropout,
+                        num_mlp_layers=num_mlp_layers,
+                        use_mlp_ln=use_mlp_ln,
+                        norm_type=norm_type,
+                        mlp_type=mlp_type,
+                        set_max_items=set_max_items,
+                        use_bfloat16=use_bfloat16,
+                        num_layers_for_residual=len(dim_hidden) * 2,
+                        sab_dropout = sab_dropout,
+                        mab_dropout= mab_dropout,
+                        recursive_depth=3,  # hardcoded for now
+                    )
+                )
+                print(f"Added Recursive router (loop) ({layer_in_dim}, {layer_out_dim}, {layer_num_heads}) with {lt['L']} inside")
                 
             if lt == "P":
                 pma_encountered = True

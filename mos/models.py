@@ -11,6 +11,7 @@ from torch_geometric.utils import to_dense_batch, scatter, cumsum
 from collections import defaultdict
 from typing import Optional, List
 import torch_scatter
+from tqdm import tqdm
 
 from utils.norm_layers import BN, LN
 from mos.masked_layers import ESA
@@ -580,15 +581,17 @@ class Estimator(pl.LightningModule):
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int, dataloader_idx: int = 0):
         if dataloader_idx == 0:
-            val_total_loss = self._step(batch, "validation")
-            self.log("val_loss", val_total_loss)
-
+            with tqdm(total=1, desc="Validation", disable=True) as pbar:
+                val_total_loss = self._step(batch, "validation")
+                self.log("val_loss", val_total_loss)
+                pbar.update(1)
             return val_total_loss
 
         if dataloader_idx == 1:
-            val_test_total_loss = self._step(batch, "validation_test")
-            self.log("val_test_loss", val_test_total_loss)
-
+            with tqdm(total=1, desc="Validation Test", disable=True) as pbar:
+                val_test_total_loss = self._step(batch, "validation_test")
+                self.log("val_test_loss", val_test_total_loss)
+                pbar.update(1)
             return val_test_total_loss
 
 
