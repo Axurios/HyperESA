@@ -581,17 +581,13 @@ class Estimator(pl.LightningModule):
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int, dataloader_idx: int = 0):
         if dataloader_idx == 0:
-            with tqdm(total=1, desc="Validation", disable=True) as pbar:
-                val_total_loss = self._step(batch, "validation")
-                self.log("val_loss", val_total_loss)
-                pbar.update(1)
+            val_total_loss = self._step(batch, "validation")
+            self.log("val_loss", val_total_loss, prog_bar=False)
             return val_total_loss
 
         if dataloader_idx == 1:
-            with tqdm(total=1, desc="Validation Test", disable=True) as pbar:
-                val_test_total_loss = self._step(batch, "validation_test")
-                self.log("val_test_loss", val_test_total_loss)
-                pbar.update(1)
+            val_test_total_loss = self._step(batch, "validation_test")
+            self.log("val_test_loss", val_test_total_loss, prog_bar=False)
             return val_test_total_loss
 
 
@@ -685,7 +681,7 @@ class Estimator(pl.LightningModule):
                 self.log(f"{epoch_type} R2", metrics["R2"], batch_size=self.batch_size)
                 self.log(f"{epoch_type} MAE", metrics["MAE"], batch_size=self.batch_size)
                 self.log(f"{epoch_type} RMSE", metrics["RMSE"], batch_size=self.batch_size)
-                print(f"{epoch_type} RMSE", metrics["RMSE"])
+                # print(f"{epoch_type} RMSE", metrics["RMSE"])
                 self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
         
         return metrics, y_pred, y_true

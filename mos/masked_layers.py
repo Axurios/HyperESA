@@ -580,13 +580,10 @@ class Router(nn.Module):
         use_mlp_ln=False,
         mlp_dropout=0,
         activation="sigmoid",
-        beta=0.2,
         sab_dropout=0,
         mab_dropout=0,
     ):
         super(Router, self).__init__()
-
-        self.beta = beta
         # want seq_len to get k, want k to get 
 
         # self.dim_in = dim_in ; self.dim_out = dim_out
@@ -600,11 +597,9 @@ class Router(nn.Module):
         # need new set_max_items,
         # print(set_max_items)
         self.k = set_max_items # if just attention
-        # self.k_beta = int(self.beta * set_max_items)  # number of tokens to keep per sequence
         # self.k = int(set_max_items ** (2/3))
         # self.k3 = int(set_max_items ** 0.5)
         # print(self.k, "nbr of tokens left k")
-        # print(self.k_beta, "k beta")
         # print(self.k3, "k3")
         if "M2" in self.layers_in:
             self.k = self.k = int(set_max_items ** (2/3))+1
@@ -613,18 +608,8 @@ class Router(nn.Module):
 
         for lt in self.layers_in:
             if lt in ["S", "M", "M2", "M3"]:
-                if lt == "S":
-                    idx = 0
-                if lt == "M":
-                    idx = 1
-                if lt == "M2":
-                    print(self.k, "nbr of tokens left k")
-                    idx = 3
-                if lt == "M3":
-                    # self.k = int(set_max_items ** 0.5)+1
-                    print(self.k, "nbr of tokens left k")
-                    idx = 4
-                # idx = 0 if lt == "S" else 1
+                idx_mapping = {"S": 0, "M": 1, "M2": 3, "M3": 4}
+                idx = idx_mapping.get(lt)
 
                 self.router_seq.append(
                     SABComplete(  
@@ -749,15 +734,12 @@ class RecursiveRouter(nn.Module):
         use_mlp_ln=False,
         mlp_dropout=0,
         activation="sigmoid",
-        beta=0.2,
         sab_dropout=0,
         mab_dropout=0,
         recursive_depth=3,
     ):
         super(RecursiveRouter, self).__init__()
 
-        self.beta = beta
-        # self.dim_in = dim_in ; self.dim_out = dim_out
         self.recursive_depth = recursive_depth
         self.linear = nn.Linear(dim_in, 1, bias=False)
         self.activation = activation
@@ -770,18 +752,8 @@ class RecursiveRouter(nn.Module):
 
         for lt in self.layers_in:
             if lt in ["S", "M", "M2", "M3"]:
-                if lt == "S": 
-                    idx = 0
-                if lt == "M":
-                    idx = 1
-                if lt == "M2":
-                    print(self.k, "nbr of tokens left k")
-                    idx = 3
-                if lt == "M3":
-                    # self.k = int(set_max_items ** 0.5)+1
-                    print(self.k, "nbr of tokens left k")
-                    idx = 4
-                # idx = 0 if lt == "S" else 1
+                idx_mapping = {"S": 0, "M": 1, "M2": 3, "M3": 4}
+                idx = idx_mapping.get(lt)
 
                 self.router_seq.append(
                     SABComplete(  
@@ -961,8 +933,10 @@ class ESA(nn.Module):
             else:
                 layer_out_dim = -1
             
-            if lt in ["S", "M"] and not pma_encountered:
-                idx = 0 if lt == "S" else 1
+            if lt in ["S", "M", "M2", "M3"] and not pma_encountered:
+                # idx = 0 if lt == "S" else 1
+                idx_mapping = {"S": 0, "M": 1, "M2": 3, "M3": 4}
+                idx = idx_mapping.get(lt)
                 dropout_val = sab_dropout if lt == "S" else mab_dropout
 
                 self.encoder.append(
