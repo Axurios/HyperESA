@@ -803,7 +803,7 @@ class RecursiveRouter(nn.Module):
 
 
         for depth in range(self.recursive_depth):
-            print(f"Processing recursive depth {depth + 1} of {self.recursive_depth}")
+            # print(f"Processing recursive depth {depth + 1} of {self.recursive_depth}")
             # Pass selected tokens through the corresponding router layer
             enc_Xtopk, _, _, _, _ = self.router_seq((X_topk, edge_index, batch_mapping, self.k, None))
 
@@ -1000,6 +1000,7 @@ class ESA(nn.Module):
             
             if isinstance(lt, dict) and "L" in lt:
                 # how to put max recursive depth in hyperparameters ?
+                max_recursive_depth = 3
                 self.encoder.append(
                     RecursiveRouter(
                         lt['L'],
@@ -1024,7 +1025,7 @@ class ESA(nn.Module):
                         num_layers_for_residual=len(dim_hidden) * 2,
                         sab_dropout = sab_dropout,
                         mab_dropout= mab_dropout,
-                        recursive_depth=3,  # hardcoded for now
+                        recursive_depth=max_recursive_depth,  # hardcoded for now
                     )
                 )
                 print(f"Added Recursive router (loop) ({layer_in_dim}, {layer_out_dim}, {layer_num_heads}) with {lt['L']} inside")
