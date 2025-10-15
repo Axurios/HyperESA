@@ -30,7 +30,7 @@ def parse_layers(tokens, i=0):
     result = []
     while i < len(tokens):
         tok = tokens[i]
-        if tok == "R" or tok == "L":  # Either router or layer starts: expect '['
+        if tok == "R" or tok == "L" or tok=="T":  # Either router or layer starts: expect '['
             assert tokens[i + 1] == "[", f"Expected '[', got {tokens[i + 1]}"
             inner, j = parse_layers(tokens, i + 2)  # parse inside the router or layer
             
@@ -38,6 +38,8 @@ def parse_layers(tokens, i=0):
                 result.append({"R": inner})  # Add router
             elif tok == "L":
                 result.append({"L": inner})  # Add layer
+            elif tok == "T":
+                result.append({"T": inner})  # Add layer
             i = j
             
         elif tok == "]":  # Router or Layer end
@@ -839,6 +841,97 @@ class RecursiveRouter(nn.Module):
 
 
 
+class TRMRouter(nn.Module):
+    def __init__(
+        self,
+        layers_inside,
+        dim_in,
+        dim_out,
+        num_heads,
+        dropout,
+        idx,
+        norm_type,
+        use_mlp=False,
+        mlp_hidden_size=64,
+        mlp_type="standard",
+        node_or_edge="edge",
+        xformers_or_torch_attn="xformers",
+        residual_dropout=0,
+        set_max_items=0,
+        use_bfloat16=True,
+        num_mlp_layers=3,
+        pre_or_post="pre",
+        num_layers_for_residual=0,
+        use_mlp_ln=False,
+        mlp_dropout=0,
+        activation="sigmoid",
+        sab_dropout=0,
+        mab_dropout=0,
+        recursive_depth=3,
+    ):
+        super(RecursiveRouter, self).__init__()
+
+        self.recursive_depth = recursive_depth
+        # self.linear = nn.Linear(dim_in, 1, bias=False)
+        self.activation = activation
+
+        self.layers_in = layers_inside
+        # print(layers_inside)
+        
+        self.router_seq = []
+        # self.k = set_max_items # if just attention
+
+        for lt in self.layers_in:
+            if lt in ["S", "M", "M2", "M3"]:
+                idx_mapping = {"S": 0, "M": 1, "M2": 3, "M3": 4}
+                idx = idx_mapping.get(lt)
+
+                self.router_seq.append(
+                    SABComplete(  
+                        dim_in,
+                        dim_out,
+                        num_heads,
+                        idx=idx,
+                        dropout=dropout,
+                        node_or_edge=node_or_edge,
+                        xformers_or_torch_attn=xformers_or_torch_attn,
+                        pre_or_post=pre_or_post,
+                        residual_dropout=residual_dropout,
+                        use_mlp=use_mlp,
+                        mlp_hidden_size=mlp_hidden_size,
+                        mlp_dropout=mlp_dropout,
+                        num_mlp_layers=num_mlp_layers,
+                        use_mlp_ln=use_mlp_ln,
+                        norm_type=norm_type,
+                        mlp_type=mlp_type,
+                        set_max_items=self.k,
+                        use_bfloat16=use_bfloat16,
+                        num_layers_for_residual=num_layers_for_residual,
+                    )
+                )
+                print(f"Added recursive encoder {lt} ", f"({dim_in}, {dim_out}, {num_heads})")
+        self.router_seq = nn.Sequential(*self.router_seq)
+                
+
+    def forward(self, inp):
+        X, edge_index, batch_mapping, max_items, adj_mask = inp
+        batch_size, seq_len, hidden_dim = X.shape
+
+        out = X
+
+        for depth in range(self.recursive_depth - 1):
+            with torch.no_grad():
+                out, _, _, _, _ = self.router_seq((out, edge_index, batch_mapping, max_items, adj_mask))
+        # Final recursion step with gradients
+        out, _, _, _, _ = self.router_seq((out, edge_index, batch_mapping, max_items, adj_mask))
+
+        return out, edge_index, batch_mapping, max_items, adj_mask
+    
+
+
+
+
+
 
 
 
@@ -964,71 +1057,142 @@ class ESA(nn.Module):
                 )
                 print(f"Added encoder {'SAB' if lt == 'S' else 'MAB'} ", f"({layer_in_dim}, {layer_out_dim}, {layer_num_heads})")
                 
+            router_types = {
+                "R": Router,
+                "L": RecursiveRouter,
+                "T": RecursiveRouter  # if L and T both map to RecursiveRouter
+            }
+            max_recursive_depth = 3
+            # max_recursive_depth = hyperparams.get("recursive_depth", 3)   
+            if isinstance(lt, dict):
+                for key, router_class in router_types.items():
+                    if key in lt:
+                        layer_config = lt[key]
+                        self.encoder.append(
+                            router_class(
+                                layer_config,
+                                layer_in_dim,
+                                layer_out_dim,
+                                layer_num_heads,
+                                idx=idx,
+                                dropout=dropout_val,
+                                node_or_edge=node_or_edge,
+                                xformers_or_torch_attn=xformers_or_torch_attn,
+                                pre_or_post=pre_or_post,
+                                residual_dropout=residual_dropout,
+                                use_mlp=use_mlps,
+                                mlp_hidden_size=mlp_hidden_size,
+                                mlp_dropout=mlp_dropout,
+                                num_mlp_layers=num_mlp_layers,
+                                use_mlp_ln=use_mlp_ln,
+                                norm_type=norm_type,
+                                mlp_type=mlp_type,
+                                set_max_items=set_max_items,
+                                use_bfloat16=use_bfloat16,
+                                num_layers_for_residual=len(dim_hidden) * 2,
+                                sab_dropout=sab_dropout,
+                                mab_dropout=mab_dropout,
+                                **({"recursive_depth": max_recursive_depth} if key in ["L", "T"] else {})
+                            )
+                        )
+                        print(f"Added {'TRM' if key == 'T' else 'Recursive' if key == 'L' else 'Router'} "
+                            f"({layer_in_dim}, {layer_out_dim}, {layer_num_heads}) with {layer_config} inside")
+            # if isinstance(lt, dict) and "R" in lt:
+            #     # print("found a dict", lt)
+            #     # idx = 0 if lt == "S" else 1
+            #     # dropout_val = sab_dropout if lt == "S" else mab_dropout
 
-            if isinstance(lt, dict) and "R" in lt:
-                # print("found a dict", lt)
-                # idx = 0 if lt == "S" else 1
-                # dropout_val = sab_dropout if lt == "S" else mab_dropout
-
-                self.encoder.append(
-                    Router(
-                        lt['R'],
-                        layer_in_dim,
-                        layer_out_dim,
-                        layer_num_heads,
-                        idx=idx,
-                        dropout=dropout_val,
-                        node_or_edge=node_or_edge,
-                        xformers_or_torch_attn=xformers_or_torch_attn,
-                        pre_or_post=pre_or_post,
-                        residual_dropout=residual_dropout,
-                        use_mlp=use_mlps,
-                        mlp_hidden_size=mlp_hidden_size,
-                        mlp_dropout=mlp_dropout,
-                        num_mlp_layers=num_mlp_layers,
-                        use_mlp_ln=use_mlp_ln,
-                        norm_type=norm_type,
-                        mlp_type=mlp_type,
-                        set_max_items=set_max_items,
-                        use_bfloat16=use_bfloat16,
-                        num_layers_for_residual=len(dim_hidden) * 2,
-                        sab_dropout = sab_dropout,
-                        mab_dropout= mab_dropout,
-                    )
-                )
-                print(f"Added Router ({layer_in_dim}, {layer_out_dim}, {layer_num_heads}) with {lt['R']} inside")
+            #     self.encoder.append(
+            #         Router(
+            #             lt['R'],
+            #             layer_in_dim,
+            #             layer_out_dim,
+            #             layer_num_heads,
+            #             idx=idx,
+            #             dropout=dropout_val,
+            #             node_or_edge=node_or_edge,
+            #             xformers_or_torch_attn=xformers_or_torch_attn,
+            #             pre_or_post=pre_or_post,
+            #             residual_dropout=residual_dropout,
+            #             use_mlp=use_mlps,
+            #             mlp_hidden_size=mlp_hidden_size,
+            #             mlp_dropout=mlp_dropout,
+            #             num_mlp_layers=num_mlp_layers,
+            #             use_mlp_ln=use_mlp_ln,
+            #             norm_type=norm_type,
+            #             mlp_type=mlp_type,
+            #             set_max_items=set_max_items,
+            #             use_bfloat16=use_bfloat16,
+            #             num_layers_for_residual=len(dim_hidden) * 2,
+            #             sab_dropout = sab_dropout,
+            #             mab_dropout= mab_dropout,
+            #         )
+            #     )
+            #     print(f"Added Router ({layer_in_dim}, {layer_out_dim}, {layer_num_heads}) with {lt['R']} inside")
             
-            if isinstance(lt, dict) and "L" in lt:
-                # how to put max recursive depth in hyperparameters ?
-                max_recursive_depth = 3
-                self.encoder.append(
-                    RecursiveRouter(
-                        lt['L'],
-                        layer_in_dim,
-                        layer_out_dim,
-                        layer_num_heads,
-                        idx=idx,
-                        dropout=dropout_val,
-                        node_or_edge=node_or_edge,
-                        xformers_or_torch_attn=xformers_or_torch_attn,
-                        pre_or_post=pre_or_post,
-                        residual_dropout=residual_dropout,
-                        use_mlp=use_mlps,
-                        mlp_hidden_size=mlp_hidden_size,
-                        mlp_dropout=mlp_dropout,
-                        num_mlp_layers=num_mlp_layers,
-                        use_mlp_ln=use_mlp_ln,
-                        norm_type=norm_type,
-                        mlp_type=mlp_type,
-                        set_max_items=set_max_items,
-                        use_bfloat16=use_bfloat16,
-                        num_layers_for_residual=len(dim_hidden) * 2,
-                        sab_dropout = sab_dropout,
-                        mab_dropout= mab_dropout,
-                        recursive_depth=max_recursive_depth,  # hardcoded for now
-                    )
-                )
-                print(f"Added Recursive router (loop) ({layer_in_dim}, {layer_out_dim}, {layer_num_heads}) with {lt['L']} inside")
+            # if isinstance(lt, dict) and "L" in lt:
+            #     # how to put max recursive depth in hyperparameters ?
+            #     max_recursive_depth = 3
+            #     self.encoder.append(
+            #         RecursiveRouter(
+            #             lt['L'],
+            #             layer_in_dim,
+            #             layer_out_dim,
+            #             layer_num_heads,
+            #             idx=idx,
+            #             dropout=dropout_val,
+            #             node_or_edge=node_or_edge,
+            #             xformers_or_torch_attn=xformers_or_torch_attn,
+            #             pre_or_post=pre_or_post,
+            #             residual_dropout=residual_dropout,
+            #             use_mlp=use_mlps,
+            #             mlp_hidden_size=mlp_hidden_size,
+            #             mlp_dropout=mlp_dropout,
+            #             num_mlp_layers=num_mlp_layers,
+            #             use_mlp_ln=use_mlp_ln,
+            #             norm_type=norm_type,
+            #             mlp_type=mlp_type,
+            #             set_max_items=set_max_items,
+            #             use_bfloat16=use_bfloat16,
+            #             num_layers_for_residual=len(dim_hidden) * 2,
+            #             sab_dropout = sab_dropout,
+            #             mab_dropout= mab_dropout,
+            #             recursive_depth=max_recursive_depth,  # hardcoded for now
+            #         )
+            #     )
+            #     print(f"Added Recursive router (loop) ({layer_in_dim}, {layer_out_dim}, {layer_num_heads}) with {lt['L']} inside")
+            
+            # if isinstance(lt, dict) and "T" in lt:
+            #     # how to put max recursive depth in hyperparameters ?
+            #     max_recursive_depth = 3
+            #     self.encoder.append(
+            #         RecursiveRouter(
+            #             lt['T'],
+            #             layer_in_dim,
+            #             layer_out_dim,
+            #             layer_num_heads,
+            #             idx=idx,
+            #             dropout=dropout_val,
+            #             node_or_edge=node_or_edge,
+            #             xformers_or_torch_attn=xformers_or_torch_attn,
+            #             pre_or_post=pre_or_post,
+            #             residual_dropout=residual_dropout,
+            #             use_mlp=use_mlps,
+            #             mlp_hidden_size=mlp_hidden_size,
+            #             mlp_dropout=mlp_dropout,
+            #             num_mlp_layers=num_mlp_layers,
+            #             use_mlp_ln=use_mlp_ln,
+            #             norm_type=norm_type,
+            #             mlp_type=mlp_type,
+            #             set_max_items=set_max_items,
+            #             use_bfloat16=use_bfloat16,
+            #             num_layers_for_residual=len(dim_hidden) * 2,
+            #             sab_dropout = sab_dropout,
+            #             mab_dropout= mab_dropout,
+            #             recursive_depth=max_recursive_depth,  # hardcoded for now
+            #         )
+            #     )
+            #     print(f"Added TRM router (loop) ({layer_in_dim}, {layer_out_dim}, {layer_num_heads}) with {lt['T']} inside")
                 
             if lt == "P":
                 pma_encountered = True

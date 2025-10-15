@@ -119,6 +119,7 @@ def main():
     parser.add_argument("--train-missing-edge", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--train-hidden", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--reconstruction", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--curvature", default=False, action=argparse.BooleanOptionalAction)
 
     args = parser.parse_args()
 
@@ -202,6 +203,7 @@ def main():
                 dataset=dataset,
                 dataset_dir=dataset_download_dir,
                 add_hyper_edges=argsdict.get("add_hyper_edges", False),
+                curvature=argsdict.get("curvature", False),
             )
         # Graph-level branch
         else:
@@ -212,6 +214,7 @@ def main():
                 target_name=target_name,
                 pe_types=posenc,
                 add_hyper_edges=argsdict.get("add_hyper_edges", False),
+                curvature=argsdict.get("curvature", False),
             )
 
         num_features = train[0].x.shape[-1]

@@ -19,7 +19,7 @@ from data_loading.graphgps_utils import join_dataset_splits
 from data_loading.transforms import *
 
 from data_loading.hypergraph_construction import draw_pyg_as_xgi, add_hyper_edges_to_dataset_no_vocab, add_one_random_subgroup_hyperedge, AddChemHyperEdges
-
+from data_loading.curvature import compute_forman_ricci_for_dataset
 from rdkit import RDLogger
 
 RDLogger.DisableLog("rdApp.*")
@@ -438,6 +438,7 @@ def load_tudataset(dataset_name, download_dir, one_hot=True, **kwargs):
 def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
     print("Loading QM9 dataset...")
     add_hyper_edges = kwargs.get("add_hyper_edges", False)
+    curvature = kwargs.get("curvature", False)
 
     # print("target names :", target_name)
     if target_name == ["all"]:
@@ -506,11 +507,17 @@ def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
                 max_hyper_data = data ; max_idx = idx
 
         print(f"Max hyperedges found: {max_hyperedges}") ; print(max_hyper_data.hyperedges)
-        # normal_graph_data = train[max_idx]
-        # draw_pyg_as_xgi(normal_graph_data) ; draw_pyg_as_xgi(max_hyper_data)
+        normal_graph_data = train[max_idx]
+        draw_pyg_as_xgi(normal_graph_data) ; draw_pyg_as_xgi(max_hyper_data)
 
         train = train_hyper ; val = val_hyper ; test = test_hyper
     # ----------------------
+
+
+
+
+
+
 
     print("Scaling dataset y values...")
     num_classes = len(target_indices)
@@ -521,6 +528,13 @@ def load_qm9_chemprop(download_dir, one_hot, target_name, **kwargs):
     print("Finished loading data!")
     task_type = "regression"
 
+    if curvature:
+        print("Computing curvature of graphs...")
+        compute_forman_ricci_for_dataset(train)
+        print("Curvature of Line-graphs...")
+
+        print("Displaying curvatures distribution...")
+        pass
     return train, val, test, num_classes, task_type, y_scaler
 
 
