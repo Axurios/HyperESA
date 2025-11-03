@@ -5,6 +5,7 @@ from torch.nn.init import xavier_uniform_, constant_, xavier_normal_
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from xformers.ops import memory_efficient_attention
 from opt_einsum import contract
+import opt_einsum as oe
 
 class MAB(nn.Module):
     def __init__(self, dim_Q, dim_K, dim_V, num_heads, dropout_p=0.0, xformers_or_torch_attn="xformers"):
@@ -127,6 +128,8 @@ class M_2Simp_AB(nn.Module):
         xavier_normal_(self.fc_k.weight) ; xavier_normal_(self.fc_v.weight)
         xavier_normal_(self.fc_k2.weight) ; xavier_normal_(self.fc_v2.weight)
 
+        # self.s2_path = oe.contract_path("bhqd,bhkd,bhld->bhqkl", Q, K, K2, optimize="optimal")[0]
+
 
     def forward(self, Q, K, adj_mask=None):
         batch_size = Q.size(0)
@@ -150,6 +153,8 @@ class M_2Simp_AB(nn.Module):
 
         # s2_attn_logits = torch.einsum("bhqd,bhkd,bhld->bhqkl", Q, K, K2)
         s2_attn_logits = contract("bhqd,bhkd,bhld->bhqkl", Q, K, K2)
+        # path, desc = oe.contract_path("bhqd,bhkd,bhld->bhqkl", Q, K, K2, optimize="optimal")
+        # print(desc)
        
         logits_shape = s2_attn_logits.shape
         s2_flat = s2_attn_logits.flatten(start_dim=3)
@@ -161,6 +166,8 @@ class M_2Simp_AB(nn.Module):
 
         # out = torch.einsum("bhqkl,bhkd,bhld->bhqd", attn_weights, V, V2)
         out = contract("bhqkl,bhkd,bhld->bhqd", attn_weights, V, V2)
+        #path, desc = oe.contract_path("bhqkl,bhkd,bhld->bhqd", attn_weights, V, V2, optimize="optimal")
+        #print(desc)
     
         out = out.reshape(batch_size, -1, self.num_heads * head_dim)
         out = out + F.mish(self.fc_o(out))

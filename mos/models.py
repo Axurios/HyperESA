@@ -4,7 +4,7 @@ import numpy as np
 import pytorch_lightning as pl
 import bitsandbytes as bnb
 import itertools
-
+from collections import Counter
 from torch import nn
 from torch.nn import functional as F
 from torch_geometric.utils import to_dense_batch, scatter, cumsum
@@ -12,7 +12,7 @@ from collections import defaultdict
 from typing import Optional, List
 import torch_scatter
 from tqdm import tqdm
-
+import matplotlib.pyplot as plt
 from utils.norm_layers import BN, LN
 from mos.masked_layers import ESA
 from mos.mlp_utils import SmallMLP, GatedMLPMulti
@@ -305,7 +305,7 @@ class Estimator(pl.LightningModule):
         # Uncomment if you want the gated MLP here
         self.register_buffer("shared_masking_token", torch.full((self.hidden_dims[0],), 0.1))
         # 2 * node_feat_dim + edge_dim
-
+        self.norms_list = [] ; self.rank_list = []
             
         # elif self.mlp_type == "gated_mlp":
         #     self.output_mlp = GatedMLPMulti(
@@ -390,9 +390,11 @@ class Estimator(pl.LightningModule):
             h = self.node_edge_mlp(h)
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
             # print("ok")
-            h, _ = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=None, hedge_batch_index=edge_batch_index)
+            h, _, norms_tensor, rank_tensor = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=None, hedge_batch_index=edge_batch_index)
 
-
+            # print(norms_tensor.shape, "norm shapes")
+            self.norms_list.append(norms_tensor)
+            self.rank_list.append(rank_tensor)
             # if self.train_missing_edge:
             #     # target_connectivity = None
 
@@ -684,6 +686,63 @@ class Estimator(pl.LightningModule):
                 # print(f"{epoch_type} RMSE", metrics["RMSE"])
                 self.log(f"{epoch_type} SMAPE", metrics["SMAPE"], batch_size=self.batch_size)
         
+        shapes = [tuple(t.shape) for t in self.norms_list]
+
+        # find the most common shape
+        most_common_shape = Counter(shapes).most_common(1)[0][0]
+        filtered_tensors = [t for t in self.norms_list if tuple(t.shape) == most_common_shape]
+        norms_tensors = torch.stack(filtered_tensors, dim=0)
+        # norms_tensors = torch.stack(self.norms_list[:-1], dim=0) # shape: [num_batches, num_layers, batch_size]
+        _, num_layers, _ = norms_tensors.shape
+        # Reshape to [num_layers, total_samples]
+        data_per_layer = norms_tensors.permute(1, 0, 2).reshape(num_layers, -1)
+        # Compute mean and std per layer
+        mean_per_layer = data_per_layer.mean(dim=1).cpu().numpy()  # shape [num_layers]
+        std_per_layer = data_per_layer.std(dim=1).cpu().numpy()    # shape [num_layers]
+        layers = torch.arange(num_layers).cpu().numpy()
+
+        lower = np.clip(mean_per_layer - std_per_layer, 0, 1)
+        upper = np.clip(mean_per_layer + std_per_layer, 0, 1)
+
+
+
+        # --- rank processing ---
+        shapes_r = [tuple(t.shape) for t in self.rank_list]
+        most_common_shape_r = Counter(shapes_r).most_common(1)[0][0]
+        filtered_ranks = [t for t in self.rank_list if tuple(t.shape) == most_common_shape_r]
+        ranks_tensors = torch.stack(filtered_ranks, dim=0)  # [num_batches, num_layers, batch_size]
+        _, num_layers_r, _ = ranks_tensors.shape
+        assert num_layers == num_layers_r, "Rank and norm lists must have same num_layers."
+        data_per_layer_r = ranks_tensors.permute(1, 0, 2).reshape(num_layers_r, -1)
+        mean_per_layer_r = data_per_layer_r.mean(dim=1).cpu().numpy()
+        std_per_layer_r = data_per_layer_r.std(dim=1).cpu().numpy()
+        # mean = np.clip(mean_per_layer, 0, 1)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        # norm plot
+        axes[0].plot(layers, mean_per_layer, color='blue', label='Mean μ-norm')
+        axes[0].fill_between(layers, lower, upper, color='blue', alpha=0.3, label='Std Dev')
+        axes[0].set_xlabel('Layer')
+        axes[0].set_ylabel('residual relative norm')
+        axes[0].set_title('Mean Residual Relative Norm per Layer')
+        axes[0].legend()
+
+        # rank/effective rank plot
+        axes[1].plot(layers, mean_per_layer_r, color='green', label=f'Mean effective rank')
+        axes[1].fill_between(layers,
+                            mean_per_layer_r - std_per_layer_r,
+                            mean_per_layer_r + std_per_layer_r,
+                            color='green',
+                            alpha=0.3,
+                            label='Std Dev')
+        axes[1].set_xlabel('Layer')
+        axes[1].set_ylabel('effective rank per layer')
+        axes[1].set_title(f'Mean effective rank per Layer')
+        axes[1].legend()
+
+        plt.tight_layout()
+        plt.show()
+
         return metrics, y_pred, y_true
     
 

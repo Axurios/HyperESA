@@ -1264,7 +1264,7 @@ class ESA(nn.Module):
 
 
     def forward(self, X, edge_index, batch_mapping, num_max_items, is_using_hyperedges=False, hyperedge_index=None, hedge_batch_index=None,):
-
+        norms_list = [] ; rank_list = []
         if self.node_or_edge == "node":
             adj_mask = get_adj_mask_from_edge_index_node(
                 edge_index=edge_index,
@@ -1297,13 +1297,21 @@ class ESA(nn.Module):
             layer = self.encoder[layer_idx]  # get the layer from nn.Sequential
             # if layer is a router, then do smthing to keep the x, etc.
             enc, _, _,  _, _ = layer((enc, edge_index, batch_mapping, num_max_items, adj_mask))  # forward pass through the layer
+            with torch.no_grad():
+                mu_norm = compute_mu_norm(enc)
+                norms_list.append(mu_norm)
+
+                eff_rank = batched_effective_rank(enc)
+                rank_list.append(eff_rank)
 
         if hasattr(self, "dim_pma") and self.dim_hidden[0] != self.dim_pma:
             X = self.out_proj(X)
 
         enc = enc + X
         # print("enc shape", enc.shape)
-        
+        norms_tensor = torch.stack(norms_list, dim=0)
+        rank_tensor = torch.stack(rank_list, dim=0)
+        # print(norms_tensor.shape, "norms tensor shape")
         # latent_rep_loss = 0.0 
 
         if hasattr(self, "decoder"):
@@ -1312,4 +1320,40 @@ class ESA(nn.Module):
         else:
             out = enc
 
-        return F.mish(self.decoder_linear(out)), enc
+        return F.mish(self.decoder_linear(out)), enc, norms_tensor, rank_tensor
+
+
+
+
+def compute_mu_norm(X):
+    # print(X.shape)
+    batch_size, n, d = X.shape
+    # Step 1: Compute γX = (1^T X) / N # Sum along the rows (dim=0), then divide by N
+    # gamma_X = X.sum(dim=0, keepdim=True) / N
+    gamma_X = X.sum(dim=(1, 2), keepdim=True) / (n * d)
+    # Step 2: Compute the residual X - γX
+    residual = X - gamma_X
+    # Step 3: Compute the Frobenius norm of the residual
+    frobenius_norm = torch.norm(residual, p='fro', dim=(1, 2))  # Frobenius norm
+    original_frobenius_norm = torch.norm(X, p='fro', dim=(1, 2))
+    relative_norm = frobenius_norm / original_frobenius_norm
+    # print(relative_norm.shape, "frob norm")
+    return relative_norm
+
+
+
+def batched_effective_rank(X: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    # Compute singular values: shape (B, min(N, D))
+    S = torch.linalg.svdvals(X)
+    # Normalize singular values to get probability vectors
+    S_sum = S.sum(dim=1, keepdim=True)  # shape (B, 1)
+    mask = S_sum > eps  # to handle all-zero matrices
+    p = S / (S_sum + eps)  # shape (B, r)
+    # Compute entropy per batch
+    entropy = -torch.sum(p * torch.log(p + eps), dim=1)  # shape (B,)
+    # Effective rank = exp(entropy)
+    eff_rank = torch.exp(entropy)
+    # Zero out effective rank where total singular value was too small
+    eff_rank = eff_rank * mask.squeeze(1)
+
+    return eff_rank
