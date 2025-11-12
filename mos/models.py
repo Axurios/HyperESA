@@ -390,17 +390,16 @@ class Estimator(pl.LightningModule):
             h = self.node_edge_mlp(h)
             h, _ = to_dense_batch(h, edge_batch_index, fill_value=0, max_num_nodes=num_max_items)
             # print("ok")
-            h, _, norms_tensor, rank_tensor = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=None, hedge_batch_index=edge_batch_index)
+            h, _, norms_tensor = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=None, hedge_batch_index=edge_batch_index)
             # h, _,  = self.st_fast(h, edge_index, batch_mapping, num_max_items=num_max_items, is_using_hyperedges=self.use_hyperedges, hyperedge_index=None, hedge_batch_index=edge_batch_index)
             # # print(norms_tensor.shape, "norm shapes")
             # self.norms_list.append(norms_tensor)
             # self.rank_list.append(rank_tensor)
-            for layer_idx, (norm_val, rank_val) in enumerate(zip(norms_tensor, rank_tensor)):
+            for layer_idx, norm_val in enumerate(norms_tensor):
                 self.log_dict({
-                    f"norm/layer_{layer_idx}": norm_val.mean().item(),
-                    f"rank/layer_{layer_idx}": rank_val.mean().item()
+                    f"norm/layer_{layer_idx}": norm_val.mean().item()
                 })
-
+            # f"rank/layer_{layer_idx}": rank_val.mean().item()
 
                 
         # NSA

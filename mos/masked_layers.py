@@ -1447,8 +1447,8 @@ class ESA(nn.Module):
                 mu_norm = compute_mu_norm(enc)
                 norms_list.append(mu_norm)
 
-                eff_rank = batched_effective_rank(enc)
-                rank_list.append(eff_rank)
+                #eff_rank = batched_effective_rank(enc)
+                # rank_list.append(eff_rank)
 
         if hasattr(self, "dim_pma") and self.dim_hidden[0] != self.dim_pma:
             X = self.out_proj(X)
@@ -1456,7 +1456,7 @@ class ESA(nn.Module):
         enc = enc + X
         # print("enc shape", enc.shape)
         norms_tensor = torch.stack(norms_list, dim=0)
-        rank_tensor = torch.stack(rank_list, dim=0)
+        #rank_tensor = torch.stack(rank_list, dim=0)
         # print(norms_tensor.shape, "norms tensor shape")
         # latent_rep_loss = 0.0 
 
@@ -1466,7 +1466,7 @@ class ESA(nn.Module):
         else:
             out = enc
 
-        return F.mish(self.decoder_linear(out)), enc, norms_tensor, rank_tensor
+        return F.mish(self.decoder_linear(out)), enc, norms_tensor #, rank_tensor
         #return F.mish(self.decoder_linear(out)), enc
     
 
