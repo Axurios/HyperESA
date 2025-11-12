@@ -838,10 +838,142 @@ class RecursiveRouter(nn.Module):
 
 
 
+class SABrouter(nn.Module):
+    def __init__(
+        self,
+        dim_in,dim_out,num_heads,dropout,idx,norm_type,use_mlp=False,mlp_hidden_size=64,mlp_type="standard",node_or_edge="edge",
+        xformers_or_torch_attn="xformers",residual_dropout=0,set_max_items=0,use_bfloat16=True,num_mlp_layers=3,pre_or_post="pre",num_layers_for_residual=0,use_mlp_ln=False,
+        mlp_dropout=0,
+    ):
+        super(SABComplete, self).__init__()
+
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.num_heads = num_heads
+        self.use_mlp = use_mlp
+        self.idx = idx
+        self.mlp_hidden_size = mlp_hidden_size
+        self.node_or_edge = node_or_edge
+        self.xformers_or_torch_attn = xformers_or_torch_attn
+        self.residual_dropout = residual_dropout
+        self.set_max_items = set_max_items
+        self.use_bfloat16 = use_bfloat16
+        self.num_mlp_layers = num_mlp_layers
+        self.pre_or_post = pre_or_post
+
+        if self.pre_or_post == "post":
+            self.residual_attn = admin_torch.as_module(num_layers_for_residual)
+            self.residual_mlp = admin_torch.as_module(num_layers_for_residual)
+
+        if dim_in != dim_out:
+            self.proj_1 = nn.Linear(dim_in, dim_out)
+        
+        if self.idx == 0 or self.idx == 1:
+            self.sab = SAB(dim_in, dim_out, num_heads, dropout, xformers_or_torch_attn)
 
 
+        if self.idx == 3:
+            print("2-simplicial attention layer")
+            self.sab = S_2Simp_AB(dim_in, dim_out, num_heads, dropout, xformers_or_torch_attn)
 
-class TRMRouter(nn.Module):
+        if self.idx == 4:
+            print("3-simplicial attention layer")
+            self.sab = S_3Simp_AB(dim_in, dim_out, num_heads, dropout, xformers_or_torch_attn)
+
+
+        if self.idx != 2:
+            bn_dim = self.set_max_items
+        else:
+            bn_dim = 32
+
+        if norm_type == "LN":
+            if self.pre_or_post == "post":
+                if self.idx != 2:
+                    self.norm = LN(dim_out, num_elements=self.set_max_items)
+                else:
+                    self.norm = LN(dim_out)
+            else:
+                if self.idx != 2:
+                    self.norm = LN(dim_in, num_elements=self.set_max_items)
+                else:
+                    self.norm = LN(dim_in)
+                    
+        elif norm_type == "BN":
+            self.norm = BN(bn_dim)
+
+        self.mlp_type = mlp_type
+
+        if self.use_mlp:
+            if self.mlp_type == "standard":
+                self.mlp = SmallMLP(
+                    in_dim=dim_out,
+                    out_dim=dim_out,
+                    inter_dim=mlp_hidden_size,
+                    dropout_p=mlp_dropout,
+                    num_layers=num_mlp_layers,
+                    use_ln=use_mlp_ln,
+                )
+            
+            elif self.mlp_type == "gated_mlp":
+                self.mlp = GatedMLPMulti(
+                    in_dim=dim_out,
+                    out_dim=dim_out,
+                    inter_dim=mlp_hidden_size,
+                    dropout_p=mlp_dropout,
+                    num_layers=num_mlp_layers,
+                    use_ln=use_mlp_ln,
+                )
+
+        if norm_type == "LN":
+            if self.idx != 2:
+                self.norm_mlp = LN(dim_out, num_elements=self.set_max_items)
+            else:
+                self.norm_mlp = LN(dim_out)
+                
+        elif norm_type == "BN":
+            self.norm_mlp = BN(bn_dim)
+
+
+    def forward(self, inp):
+        X, edge_index, batch_mapping, max_items, adj_mask = inp
+
+        if self.pre_or_post == "pre":
+            X = self.norm(X) # also work when hyperedges in x
+        if self.idx == 1:
+            out_attn = self.sab(X, adj_mask)
+        else:
+            out_attn = self.sab(X, None)
+        
+        if out_attn.shape[-1] != X.shape[-1]:
+            X = self.proj_1(X)
+        
+        if self.pre_or_post == "pre":
+            out = X + out_attn
+        
+        if self.pre_or_post == "post":
+            out = self.residual_attn(X, out_attn)
+            out = self.norm(out)
+        
+        if self.use_mlp:
+            if self.pre_or_post == "pre":
+                out_mlp = self.norm_mlp(out)
+                out_mlp = self.mlp(out_mlp)
+                if out.shape[-1] == out_mlp.shape[-1]:
+                    out = out_mlp + out
+
+            if self.pre_or_post == "post":
+                out_mlp = self.mlp(out)
+                if out.shape[-1] == out_mlp.shape[-1]:
+                    out = self.residual_mlp(out, out_mlp)
+                out = self.norm_mlp(out)
+
+        if self.residual_dropout > 0:
+            out = F.dropout(out, p=self.residual_dropout)
+        attn_logits = None
+        return out, edge_index, batch_mapping, max_items, adj_mask, attn_logits
+
+
+class DSA_router(nn.Module):
     def __init__(
         self,
         layers_inside,
@@ -869,7 +1001,7 @@ class TRMRouter(nn.Module):
         mab_dropout=0,
         recursive_depth=3,
     ):
-        super(RecursiveRouter, self).__init__()
+        super(DSA_router, self).__init__()
 
         self.recursive_depth = recursive_depth
         # self.linear = nn.Linear(dim_in, 1, bias=False)
@@ -877,6 +1009,15 @@ class TRMRouter(nn.Module):
 
         self.layers_in = layers_inside
         # print(layers_inside)
+
+
+        self.activation_layer = SABrouter(  
+                        dim_in, dim_out, num_heads, idx=idx, dropout=dropout,
+                        node_or_edge=node_or_edge, xformers_or_torch_attn=xformers_or_torch_attn, pre_or_post=pre_or_post, residual_dropout=residual_dropout,
+                        use_mlp=use_mlp, mlp_hidden_size=mlp_hidden_size, mlp_dropout=mlp_dropout,
+                        num_mlp_layers=num_mlp_layers, use_mlp_ln=use_mlp_ln, norm_type=norm_type, mlp_type=mlp_type,
+                        set_max_items=self.k, use_bfloat16=use_bfloat16, num_layers_for_residual=num_layers_for_residual,
+                    )
         
         self.router_seq = []
         # self.k = set_max_items # if just attention
@@ -918,6 +1059,11 @@ class TRMRouter(nn.Module):
         batch_size, seq_len, hidden_dim = X.shape
 
         out = X
+            
+        # first normal attention layer, and get top k attention scores (or juste attn logits ?)
+        out, _, _, _, _, attn_logits = self.activation_layer((out, edge_index, batch_mapping, self.k, None))
+    
+        # get top k indices from attn_logits.
 
         for depth in range(self.recursive_depth - 1):
             with torch.no_grad():
@@ -1060,7 +1206,7 @@ class ESA(nn.Module):
             router_types = {
                 "R": Router,
                 "L": RecursiveRouter,
-                "T": RecursiveRouter  # if L and T both map to RecursiveRouter
+                "D": DSA_router  # if L and T both map to RecursiveRouter
             }
             max_recursive_depth = 3
             # max_recursive_depth = hyperparams.get("recursive_depth", 3)   
@@ -1092,7 +1238,7 @@ class ESA(nn.Module):
                                 num_layers_for_residual=len(dim_hidden) * 2,
                                 sab_dropout=sab_dropout,
                                 mab_dropout=mab_dropout,
-                                **({"recursive_depth": max_recursive_depth} if key in ["L", "T"] else {})
+                                **({"recursive_depth": max_recursive_depth} if key in ["L", "D"] else {})
                             )
                         )
                         print(f"Added {'TRM' if key == 'T' else 'Recursive' if key == 'L' else 'Router'} "
@@ -1299,18 +1445,18 @@ class ESA(nn.Module):
             enc, _, _,  _, _ = layer((enc, edge_index, batch_mapping, num_max_items, adj_mask))  # forward pass through the layer
             with torch.no_grad():
                 mu_norm = compute_mu_norm(enc)
-                #norms_list.append(mu_norm)
+                norms_list.append(mu_norm)
 
-                #eff_rank = batched_effective_rank(enc)
-                #rank_list.append(eff_rank)
+                eff_rank = batched_effective_rank(enc)
+                rank_list.append(eff_rank)
 
         if hasattr(self, "dim_pma") and self.dim_hidden[0] != self.dim_pma:
             X = self.out_proj(X)
 
         enc = enc + X
         # print("enc shape", enc.shape)
-        #norms_tensor = torch.stack(norms_list, dim=0)
-        #rank_tensor = torch.stack(rank_list, dim=0)
+        norms_tensor = torch.stack(norms_list, dim=0)
+        rank_tensor = torch.stack(rank_list, dim=0)
         # print(norms_tensor.shape, "norms tensor shape")
         # latent_rep_loss = 0.0 
 
@@ -1320,8 +1466,8 @@ class ESA(nn.Module):
         else:
             out = enc
 
-        #return F.mish(self.decoder_linear(out)), enc, norms_tensor, rank_tensor
-        return F.mish(self.decoder_linear(out)), enc
+        return F.mish(self.decoder_linear(out)), enc, norms_tensor, rank_tensor
+        #return F.mish(self.decoder_linear(out)), enc
     
 
 
